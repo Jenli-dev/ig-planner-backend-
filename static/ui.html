@@ -1,0 +1,131 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>IG Publisher (MVP)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root{--bg:#0b0d10;--fg:#e8edf2;--muted:#9fb0bf;--card:#12161c;--ok:#1db954;--err:#ff5c5c;--accent:#4ea3ff}
+  body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.4 system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial}
+  .wrap{max-width:860px;margin:32px auto;padding:0 16px}
+  h1{font-size:22px;margin:0 0 16px}
+  .card{background:var(--card);border:1px solid #22303d;border-radius:14px;padding:16px;margin:12px 0}
+  label{display:block;font-size:13px;color:var(--muted);margin:8px 0 6px}
+  input[type="text"],textarea{width:100%;box-sizing:border-box;background:#0f1318;color:var(--fg);
+    border:1px solid #263445;border-radius:10px;padding:10px 12px;outline:none}
+  textarea{min-height:80px;resize:vertical}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .btn{display:inline-block;background:var(--accent);color:#00152b;border:0;border-radius:10px;
+    padding:10px 14px;font-weight:600;cursor:pointer}
+  .btn:disabled{opacity:.6;cursor:not-allowed}
+  .muted{color:var(--muted);font-size:13px}
+  .ok{color:var(--ok)} .err{color:var(--err)}
+  pre{white-space:pre-wrap;background:#0b1117;border:1px solid #1d2a35;border-radius:10px;padding:10px;overflow:auto}
+  a{color:#9ad1ff}
+</style>
+
+<div class="wrap">
+  <h1>IG Publisher — Cloudinary ➜ Reels</h1>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <label>Cloudinary public_id (без расширения)</label>
+        <input id="public_id" type="text" placeholder="Напр. Public/reel_test_1757597008" />
+      </div>
+      <div>
+        <label>Cover URL (опционально)</label>
+        <input id="cover_url" type="text" placeholder="https://…/cover.jpg" />
+      </div>
+    </div>
+
+    <label>Caption</label>
+    <textarea id="caption" placeholder="Подпись к ролику…"></textarea>
+
+    <div style="display:flex;gap:12px;align-items:center;margin:8px 0 12px">
+      <label style="display:flex;gap:8px;align-items:center;margin:0">
+        <input id="share_to_feed" type="checkbox" checked />
+        <span class="muted">Показывать в сетке/ленте</span>
+      </label>
+      <button id="btn_pub" class="btn">Опубликовать по public_id</button>
+      <button id="btn_last_insights" class="btn" style="background:#33c481">Инсайты последнего поста</button>
+    </div>
+
+    <div id="out" class="muted">Готов к публикации.</div>
+    <pre id="log" style="margin-top:10px;display:none"></pre>
+  </div>
+
+  <p class="muted">Под капотом применяется авто-трансформация Cloudinary (1080×1920, 30fps, H.264 baseline, AAC, срез до 20с).</p>
+</div>
+
+<script>
+const $ = (s)=>document.querySelector(s);
+const out = $("#out");
+const logBox = $("#log");
+const btn = $("#btn_pub");
+const btnIns = $("#btn_last_insights");
+
+function log(msg, cls){
+  logBox.style.display = "block";
+  logBox.className = cls || "";
+  logBox.textContent = msg;
+}
+function ok(m){ out.innerHTML = '<span class="ok">✔</span> ' + m; }
+function err(m){ out.innerHTML = '<span class="err">✖</span> ' + m; }
+
+btn.onclick = async () => {
+  const public_id = $("#public_id").value.trim();
+  const caption = $("#caption").value.trim();
+  const cover = $("#cover_url").value.trim();
+  const share = $("#share_to_feed").checked;
+
+  if(!public_id){ err("Укажи public_id."); return; }
+
+  btn.disabled = true; err("Публикую…");
+  try{
+    const r = await fetch("/ig/publish/video_from_cloudinary", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({
+        public_id,
+        caption: caption || null,
+        cover_url: cover || null,
+        share_to_feed: !!share
+      })
+    });
+    const j = await r.json();
+    if(!j.ok) throw new Error(JSON.stringify(j,null,2));
+    ok("Опубликовано! creation_id: " + j.creation_id);
+    log(JSON.stringify(j, null, 2), "ok");
+
+    // подтянем ссылку на последний пост
+    const r2 = await fetch("/ig/media?limit=1");
+    const j2 = await r2.json();
+    const p = j2?.data?.[0]?.permalink;
+    if(p){ out.innerHTML += ` • <a target="_blank" href="${p}">Открыть в Instagram</a>`; }
+  }catch(e){
+    err("Ошибка публикации");
+    log(e.message, "err");
+  }finally{
+    btn.disabled = false;
+  }
+};
+
+btnIns.onclick = async () => {
+  btnIns.disabled = true; err("Тяну инсайты последнего поста…");
+  try{
+    const r2 = await fetch("/ig/media?limit=1");
+    const j2 = await r2.json();
+    const mediaId = j2?.data?.[0]?.id;
+    if(!mediaId) throw new Error("Нет публикаций.");
+    const rI = await fetch(`/ig/insights/media?media_id=${encodeURIComponent(mediaId)}`);
+    const jI = await rI.json();
+    if(!jI.ok) throw new Error(JSON.stringify(jI,null,2));
+    ok("Инсайты получены.");
+    log(JSON.stringify(jI, null, 2), "ok");
+  }catch(e){
+    err("Ошибка запроса инсайтов");
+    log(e.message, "err");
+  }finally{
+    btnIns.disabled = false;
+  }
+};
+</script>

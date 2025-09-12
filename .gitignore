@@ -1,0 +1,14 @@
+# secrets
+.env
+tokens.json
+
+# python
+__pycache__/
+*.pyc
+
+# videos / tmp
+static/out/**
+static/uploads/**
+
+# оставляем UI-страницу в трекинге
+!static/ui.html
