@@ -6,6 +6,16 @@ tokens.json
 __pycache__/
 *.pyc
 
+# virtualenv
+.venv/
+env/
+venv/
+
+# IDE / system
+.vscode/
+.idea/
+.DS_Store
+
 # videos / tmp
 static/out/**
 static/uploads/**
