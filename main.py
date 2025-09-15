@@ -182,9 +182,24 @@ def _ext_from_url(url: str, default=".bin") -> str:
     return guess if guess else default
 
 async def _download_to(url: str, dst_path: Path) -> Path:
-    async with httpx.AsyncClient(timeout=120) as client:
+    """
+    Скачивает файл по URL в dst_path.
+    - follow_redirects=True — чтобы принимать 302 (picsum/fastly, и т.п.)
+    - Вежливый User-Agent — для Wikimedia/CDN
+    """
+    headers = {
+        "User-Agent": "ig-planner/1.0 (+https://ig-planner-backend.onrender.com)",
+        "Accept": "*/*",
+    }
+    async with httpx.AsyncClient(timeout=120, headers=headers, follow_redirects=True) as client:
         r = await client.get(url)
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code if e.response is not None else "?"
+            location = e.response.headers.get("Location") if e.response is not None else None
+            hint = f"\nRedirect location: {location}" if location else ""
+            raise RuntimeError(f"Download failed ({status}) {url}{hint}") from None
         dst_path.write_bytes(r.content)
     return dst_path
 
