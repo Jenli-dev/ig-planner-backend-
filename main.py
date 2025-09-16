@@ -1381,154 +1381,205 @@ async def media_filter_image(
         return {"ok": False, "stage": "filter", "error": str(e)}
 
 
-# 6) FILTERS (video) — media_filter_video (с авто-фолбэком на boxblur)
+# 6) FILTERS (video) — media_filter_video (с авто-фолбэком: gblur→boxblur, vignette→paramless→remove)
 @app.post("/media/filter/video")
 async def media_filter_video(
     url: str = Body(..., embed=True),
     preset: str = Body("cinematic", embed=True),
     intensity: float = Body(0.7, embed=True),
 ):
-    import re  # для подстановки gblur -> boxblur
+    import re
+    import subprocess
 
     if not _has_ffmpeg():
         return {"ok": False, "error": "ffmpeg not available."}
+
+    # 1) скачиваем исходник
     try:
         src = UPLOAD_DIR / _uuid_name("flt_vid", _ext_from_url(url, ".mp4"))
         await _download_to(url, src)
     except Exception as e:
         return {"ok": False, "stage": "download", "error": str(e)}
-
-    # clamp 0..1
+    # 2) нормализуем интенсивность
     k = max(0.0, min(1.0, float(intensity)))
 
+    # хелпер для сборки vf-цепочки (пропускаем пустые части)
     def _chain(*filters: str) -> str:
-        """Собирает vf, пропуская пустые/None."""
         return ",".join([f for f in filters if f and str(f).strip()])
 
     pkey = (preset or "cinematic").lower().strip()
 
-    # Параметризованные пресеты (используем gblur, где доступно)
+    # 3) словарь пресетов (с gblur там, где доступно)
     vf_map: Dict[str, str] = {
-        # классика
         "b&w": "hue=s=0",
         "warm": _chain(
             f"curves=red='0/0 {0.50}/{0.60+0.20*k:.3f} 1/1'",
             f"curves=blue='0/0 {0.40}/{0.30-0.20*k:.3f} 1/1'",
-            f"eq=saturation={1+0.05*k:.3f}"
+            f"eq=saturation={1+0.05*k:.3f}",
         ),
         "cool": _chain(
             f"curves=blue='0/0 {0.50}/{0.60+0.20*k:.3f} 1/1'",
             f"curves=red='0/0 {0.40}/{0.30-0.20*k:.3f} 1/1'",
-            f"eq=saturation={1+0.03*k:.3f}"
+            f"eq=saturation={1+0.03*k:.3f}",
         ),
         "boost": _chain(
             f"eq=contrast={1+0.25*k:.3f}:saturation={1+0.25*k:.3f}:brightness={0.02*k:.3f}",
-            "unsharp"
-        ),
-        "cinematic": _chain(
-            f"eq=contrast={1+0.12*k:.3f}:saturation={1+0.12*k:.3f}",
-            f"gblur=sigma={0.3+0.7*k:.3f}",
             "unsharp",
-            f"vignette=strength={0.20+0.35*k:.3f}:radius=0.9"
         ),
-        "matte": _chain(
-            f"eq=contrast={1-0.18*k:.3f}:saturation={1-0.05*k:.3f}"
+		"cinematic": _chain(
+			f"eq=contrast={1+0.12*k:.3f}:saturation={1+0.12*k:.3f}",
+			f"gblur=sigma={0.30+0.70*k:.3f}",
+			"unsharp",
+			"vignette",
+		),
+		"teal_orange": _chain(
+			f"colorbalance=bs={-0.20*k:.3f}:gs=0:rs={0.10*k:.3f}",
+			f"eq=saturation={1+0.10*k:.3f}",
+			"vignette",
+		),
+		"vignette": _chain(
+			"vignette",
+		),		
+		"matte": _chain(
+            f"eq=contrast={1-0.18*k:.3f}:saturation={1-0.05*k:.3f}",
         ),
         "pastel": _chain(
             f"eq=contrast={1-0.15*k:.3f}:saturation={1+0.05*k:.3f}",
-            f"gblur=sigma={1+2*k:.3f}"
+            f"gblur=sigma={1.00+2.00*k:.3f}",
         ),
         "hdr": _chain(
             f"unsharp=luma_msize_x=7:luma_msize_y=7:luma_amount={1.0+1.2*k:.3f}",
-            f"eq=contrast={1+0.20*k:.3f}"
-        ),
-        "teal_orange": _chain(
-            f"colorbalance=bs={-0.20*k:.3f}:gs=0:rs={0.10*k:.3f}",
-            f"eq=saturation={1+0.10*k:.3f}",
-            f"vignette=strength={0.10+0.25*k:.3f}:radius=0.95"
+            f"eq=contrast={1+0.20*k:.3f}",
         ),
         "sepia": _chain(
             "colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131:0:0:0:0:1",
-            f"eq=contrast={1-0.18*k:.3f}:saturation={1-0.05*k:.3f}"
+            f"eq=contrast={1-0.18*k:.3f}:saturation={1-0.05*k:.3f}",
         ),
         "bleach_bypass": _chain(
             f"eq=saturation={1-0.35*k:.3f}:contrast={1+0.30*k:.3f}",
-            f"noise=alls={5+20*k:.0f}:allf=t+u"
+            f"noise=alls={5+20*k:.0f}:allf=t+u",
         ),
         "grain": _chain(
-            f"noise=alls={10+50*k:.0f}:allf=t+u"
-        ),
-        "vignette": _chain(
-            f"vignette=strength={0.15+0.55*k:.3f}:radius=0.9"
+            f"noise=alls={10+50*k:.0f}:allf=t+u",
         ),
         "clarity": _chain(
-            f"unsharp=luma_msize_x=7:luma_msize_y=7:luma_amount={1.0+1.8*k:.3f}"
+            f"unsharp=luma_msize_x=7:luma_msize_y=7:luma_amount={1.0+1.8*k:.3f}",
         ),
         "fade_soft": _chain(
             f"eq=contrast={1-0.12*k:.3f}:saturation={1-0.08*k:.3f}:brightness={0.01*k:.3f}",
-            f"gblur=sigma={0.5+1.0*k:.3f}"
+            f"gblur=sigma={0.50+1.00*k:.3f}",
         ),
         "deband": _chain(
-            f"gradfun=strength={0.50+0.80*k:.3f}"
+            f"gradfun=strength={0.50+0.80*k:.3f}",
         ),
     }
 
     vf = vf_map.get(pkey, vf_map["cinematic"])
 
-    # --- авто-фолбэк: если gblur недоступен — подменяем на boxblur ---
-    # 1) если есть регистр поддерживаемых фильтров — используем его
-    gblur_supported = True
-    try:
-        gblur_supported = _ff_filters_supported(["gblur"])["gblur"]
-    except Exception:
-        # 2) грубая эвристика: пробуем сухой запуск с gblur и смотрим stderr
-        if "gblur" in vf:
-            test_cmd = [FFMPEG, "-hide_banner", "-filters"]
-            p_test = subprocess.run(test_cmd, capture_output=True, text=True)
-            gblur_supported = ("gblur" in (p_test.stdout + p_test.stderr))
+    # 4) определяем поддержку фильтров ffmpeg
+    def _filters_supported(names: list) -> dict:
+        try:
+            info = _ff_filters_supported(names)  # если есть системная утилита
+            return {k: bool(info.get(k)) for k in names}
+        except Exception:
+            # запасной способ — парсим вывод ffmpeg -filters
+            out = subprocess.run([FFMPEG, "-hide_banner", "-filters"],
+                                 capture_output=True, text=True)
+            txt = (out.stdout or "") + (out.stderr or "")
+            return {name: (name in txt) for name in names}
 
-    if "gblur" in vf and not gblur_supported:
-        # конвертируем "gblur=sigma=X" -> "boxblur=R:P" (R≈2*X+0.5, P=1)
-        def _g2b(m: re.Match) -> str:
+    supp = _filters_supported(["gblur", "boxblur", "vignette"])
+
+    # 5) подготовим флаги и вспомогалки для подмен
+    gblur_fallback_used = False
+    vignette_paramless_used = False
+    vignette_removed = False
+
+    # helper: заменяем gblur=sigma=X -> boxblur=R:P (R≈2*X+0.5, P=1)
+    def _gblur_to_boxblur(s: str) -> str:
+        def _g2b(m):
             sigma = float(m.group(1))
             radius = max(0.1, round(2.0 * sigma + 0.5, 2))
             return f"boxblur={radius}:1"
-        vf = re.sub(r"gblur\s*=\s*sigma\s*=\s*([0-9]*\.?[0-9]+)", _g2b, vf)
-        fallback_used = True
-    else:
-        fallback_used = False
+        return re.sub(r"gblur\s*=\s*sigma\s*=\s*([0-9]*\.?[0-9]+)", _g2b, s)
 
-    # финальная нормализация формата
+    # 6) фолбэк для gblur
+    if "gblur" in vf and not supp.get("gblur", False):
+        if supp.get("boxblur", False):
+            vf = _gblur_to_boxblur(vf)
+            gblur_fallback_used = True
+        else:
+            # ни gblur, ни boxblur — удаляем сегмент gblur=...
+            vf = re.sub(r"(,)?gblur\s*=\s*[^,]+(,)?", lambda m: "," if m.group(1) and m.group(2) else "", vf).strip(",")
+            gblur_fallback_used = True  # считаем как фолбэк
+
+    # 7) деградация vignette: если фильтр есть, но нет опций strength/radius — оставляем без параметров;
+    #    если фильтра нет — удаляем совсем.
+    def _filter_has_option(fname: str, opt: str) -> bool:
+        try:
+            out = subprocess.run([FFMPEG, "-hide_banner", "-h", f"filter={fname}"],
+                                 capture_output=True, text=True, timeout=5)
+            txt = (out.stdout or "") + (out.stderr or "")
+            return (opt in txt)
+        except Exception:
+            # если не смогли проверить — лучше вернуть False, чтобы не падать на рантайме
+            return False
+
+    if "vignette" in vf:
+        if supp.get("vignette", False):
+            has_strength = _filter_has_option("vignette", "strength")
+            has_radius = _filter_has_option("vignette", "radius")
+            if not (has_strength and has_radius):
+                # заменяем любой 'vignette=...' на просто 'vignette'
+                new_vf = re.sub(r"vignette\s*=\s*[^,]+", "vignette", vf)
+                if new_vf != vf:
+                    vf = new_vf
+                    vignette_paramless_used = True
+        else:
+            # фильтра нет — аккуратно удаляем сегменты с учетом запятых
+            vf = re.sub(r"(,)?vignette\s*(=\s*[^,]+)?(,)?",
+                        lambda m: "," if m.group(1) and m.group(3) else "", vf).strip(",")
+            vignette_removed = True
+
+    # 8) финальная нормализация формата
     vf = _chain(vf, "format=yuv420p")
 
-    out = OUT_DIR / _uuid_name("flt_vid_out", ".mp4")
+    # 9) запуск ffmpeg
+    out_path = OUT_DIR / _uuid_name("flt_vid_out", ".mp4")
     cmd = [
         FFMPEG, "-y", "-i", str(src),
         "-vf", vf,
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart",
-        str(out)
+        str(out_path)
     ]
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    if p.returncode != 0:
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+
+    if proc.returncode != 0:
         return {
             "ok": False,
             "stage": "ffmpeg",
-            "stderr": p.stderr[-1000:],
+            "stderr": proc.stderr[-2000:],  # хвост для диагностики
             "vf": vf,
             "preset": pkey,
             "intensity": k,
-            "gblur_fallback": fallback_used,
+            "gblur_fallback": gblur_fallback_used,
+            "vignette_paramless": vignette_paramless_used,
+            "vignette_removed": vignette_removed,
         }
+
     return {
         "ok": True,
         "preset": pkey,
         "intensity": k,
-        "gblur_fallback": fallback_used,
         "vf": vf,
-        "output_url": _public_url(out),
-    }
+        "gblur_fallback": gblur_fallback_used,
+        "vignette_paramless": vignette_paramless_used,
+        "vignette_removed": vignette_removed,
+        "output_url": _public_url(out_path),
+    }         
+
             
 # 7) COMPOSITE COVER
 @app.post("/media/composite/cover")
