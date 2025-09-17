@@ -1,4 +1,5 @@
 import os, secrets, json, time, asyncio, uuid, subprocess, textwrap, shutil
+from jobs import create_job, set_job_status, get_job, JobStatus
 from typing import Optional, List, Dict, Any
 from urllib.parse import urlencode
 from pathlib import Path
@@ -158,6 +159,186 @@ for d in [STATIC_DIR, UPLOAD_DIR, OUT_DIR]:
 
 app = FastAPI()
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+# === background jobs ===
+VIDEO_WORKERS = int(os.getenv("VIDEO_WORKERS", "1"))
+job_queue: asyncio.Queue[str] = asyncio.Queue()
+app.state.worker_tasks: list[asyncio.Task] = []
+
+async def _process_video_task(payload: dict) -> dict:
+    """
+    Работник очереди: берёт payload = {url, preset, intensity},
+    скачивает видео и применяет фильтры через ffmpeg.
+    Возвращает dict как раньше в /media/filter/video.
+    """
+    import re
+    import subprocess
+
+    url = payload["url"]
+    preset = payload.get("preset", "cinematic")
+    intensity = float(payload.get("intensity", 0.7))
+
+    if not _has_ffmpeg():
+        raise RuntimeError("ffmpeg not available")
+
+    # 1) скачать исходник
+    src = UPLOAD_DIR / _uuid_name("flt_vid", _ext_from_url(url, ".mp4"))
+    await _download_to(url, src)
+
+    # 2) нормализуем интенсивность
+    k = max(0.0, min(1.0, intensity))
+
+    # хелпер для сборки vf-цепочки
+    def _chain(*filters: str) -> str:
+        return ",".join([f for f in filters if f and str(f).strip()])
+
+    pkey = (preset or "cinematic").lower().strip()
+
+    # 3) словарь фильтров
+    vf_map: Dict[str, str] = {
+        "b&w": "hue=s=0",
+        "warm": _chain(
+            f"curves=red='0/0 {0.50}/{0.60+0.20*k:.3f} 1/1'",
+            f"curves=blue='0/0 {0.40}/{0.30-0.20*k:.3f} 1/1'",
+            f"eq=saturation={1+0.05*k:.3f}",
+        ),
+        "cool": _chain(
+            f"curves=blue='0/0 {0.50}/{0.60+0.20*k:.3f} 1/1'",
+            f"curves=red='0/0 {0.40}/{0.30-0.20*k:.3f} 1/1'",
+            f"eq=saturation={1+0.03*k:.3f}",
+        ),
+        "boost": _chain(
+            f"eq=contrast={1+0.25*k:.3f}:saturation={1+0.25*k:.3f}:brightness={0.02*k:.3f}",
+            "unsharp",
+        ),
+        "cinematic": _chain(
+            f"eq=contrast={1+0.12*k:.3f}:saturation={1+0.12*k:.3f}",
+            f"gblur=sigma={0.30+0.70*k:.3f}",
+            "unsharp",
+            "vignette",
+        ),
+        "teal_orange": _chain(
+            f"colorbalance=bs={-0.20*k:.3f}:gs=0:rs={0.10*k:.3f}",
+            f"eq=saturation={1+0.10*k:.3f}",
+            "vignette",
+        ),
+        "vignette": _chain("vignette"),
+        "matte": _chain(
+            f"eq=contrast={1-0.18*k:.3f}:saturation={1-0.05*k:.3f}",
+        ),
+        "pastel": _chain(
+            f"eq=contrast={1-0.15*k:.3f}:saturation={1+0.05*k:.3f}",
+            f"gblur=sigma={1.00+2.00*k:.3f}",
+        ),
+        "hdr": _chain(
+            f"unsharp=luma_msize_x=7:luma_msize_y=7:luma_amount={1.0+1.2*k:.3f}",
+            f"eq=contrast={1+0.20*k:.3f}",
+        ),
+        "sepia": _chain(
+            "colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131:0:0:0:0:1",
+            f"eq=contrast={1-0.18*k:.3f}:saturation={1-0.05*k:.3f}",
+        ),
+        "bleach_bypass": _chain(
+            f"eq=saturation={1-0.35*k:.3f}:contrast={1+0.30*k:.3f}",
+            f"noise=alls={5+20*k:.0f}:allf=t+u",
+        ),
+        "grain": _chain(
+            f"noise=alls={10+50*k:.0f}:allf=t+u",
+        ),
+        "clarity": _chain(
+            f"unsharp=luma_msize_x=7:luma_msize_y=7:luma_amount={1.0+1.8*k:.3f}",
+        ),
+        "fade_soft": _chain(
+            f"eq=contrast={1-0.12*k:.3f}:saturation={1-0.08*k:.3f}:brightness={0.01*k:.3f}",
+            f"gblur=sigma={0.50+1.00*k:.3f}",
+        ),
+        "deband": _chain(
+            f"gradfun=strength={0.50+0.80*k:.3f}",
+        ),
+    }
+
+    vf = vf_map.get(pkey, vf_map["cinematic"])
+
+    # 4) проверка поддержки фильтров
+    supp = {name: _ffmpeg_has_filter(name) for name in ["gblur", "boxblur", "vignette"]}
+
+    gblur_fallback_used = False
+    vignette_paramless_used = False
+    vignette_removed = False
+
+    # gblur → boxblur
+    if "gblur" in vf and not supp.get("gblur"):
+        if supp.get("boxblur"):
+            vf = re.sub(r"gblur\s*=\s*sigma\s*=\s*([\d.]+)", lambda m: f"boxblur={round(2*float(m.group(1))+0.5,2)}:1", vf)
+            gblur_fallback_used = True
+        else:
+            vf = re.sub(r"(,)?gblur\s*=\s*[^,]+(,)?", lambda m: "," if m.group(1) and m.group(2) else "", vf).strip(",")
+            gblur_fallback_used = True
+
+    # vignette → paramless или удалить
+    if "vignette" in vf:
+        if supp.get("vignette"):
+            # оставляем как есть, но без параметров
+            vf = re.sub(r"vignette\s*=\s*[^,]+", "vignette", vf)
+            vignette_paramless_used = True
+        else:
+            vf = re.sub(r"(,)?vignette(\s*=\s*[^,]+)?(,)?", lambda m: "," if m.group(1) and m.group(3) else "", vf).strip(",")
+            vignette_removed = True
+
+    vf = _chain(vf, "format=yuv420p")
+
+    # 5) запуск ffmpeg
+    out_path = OUT_DIR / _uuid_name("flt_vid_out", ".mp4")
+    cmd = [
+        FFMPEG, "-y", "-i", str(src),
+        "-vf", vf,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        str(out_path),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed: {proc.stderr[-500:]}")
+
+    return {
+        "ok": True,
+        "preset": pkey,
+        "intensity": k,
+        "vf": vf,
+        "gblur_fallback": gblur_fallback_used,
+        "vignette_paramless": vignette_paramless_used,
+        "vignette_removed": vignette_removed,
+        "output_url": _public_url(out_path),
+    }
+
+async def _worker_loop():
+    while True:
+        job_id = await job_queue.get()
+        job = get_job(job_id)
+        if not job:
+            job_queue.task_done()
+            continue
+        set_job_status(job_id, JobStatus.RUNNING)
+        try:
+            result = await _process_video_task(job["payload"])
+            set_job_status(job_id, JobStatus.DONE, result=result)
+        except Exception as e:
+            set_job_status(job_id, JobStatus.ERROR, error=str(e))
+        finally:
+            job_queue.task_done()
+
+@app.on_event("startup")
+async def _start_workers():
+    for _ in range(VIDEO_WORKERS):
+        task = asyncio.create_task(_worker_loop())
+        app.state.worker_tasks.append(task)
+
+@app.on_event("shutdown")
+async def _stop_workers():
+    for t in app.state.worker_tasks:
+        t.cancel()
 
 # ── CORS (если надо дёргать из фронта) ─────────────────────────────────
 try:
@@ -1380,205 +1561,177 @@ async def media_filter_image(
     except Exception as e:
         return {"ok": False, "stage": "filter", "error": str(e)}
 
-
-# 6) FILTERS (video) — media_filter_video (с авто-фолбэком: gblur→boxblur, vignette→paramless→remove)
-@app.post("/media/filter/video")
-async def media_filter_video(
+# 6) FILTERS (image/video)
+@app.post("/media/filter/image")
+async def media_filter_image(
     url: str = Body(..., embed=True),
     preset: str = Body("cinematic", embed=True),
     intensity: float = Body(0.7, embed=True),
 ):
-    import re
-    import subprocess
-
-    if not _has_ffmpeg():
-        return {"ok": False, "error": "ffmpeg not available."}
-
-    # 1) скачиваем исходник
+    if not PIL_OK:
+        return {"ok": False, "error": "Pillow not installed."}
     try:
-        src = UPLOAD_DIR / _uuid_name("flt_vid", _ext_from_url(url, ".mp4"))
+        src = UPLOAD_DIR / _uuid_name("flt_img", _ext_from_url(url, ".jpg"))
         await _download_to(url, src)
+        img = Image.open(src).convert("RGB")
     except Exception as e:
-        return {"ok": False, "stage": "download", "error": str(e)}
-    # 2) нормализуем интенсивность
+        return {"ok": False, "stage": "download/open", "error": str(e)}
+
+    # clamp 0..1
     k = max(0.0, min(1.0, float(intensity)))
 
-    # хелпер для сборки vf-цепочки (пропускаем пустые части)
-    def _chain(*filters: str) -> str:
-        return ",".join([f for f in filters if f and str(f).strip()])
+    try:
+        out_img = img
 
-    pkey = (preset or "cinematic").lower().strip()
+        def _blend_color(base: Image.Image, rgb: tuple, alpha: float) -> Image.Image:
+            overlay = Image.new("RGB", base.size, rgb)
+            return Image.blend(base, overlay, max(0.0, min(1.0, alpha)))
 
-    # 3) словарь пресетов (с gblur там, где доступно)
-    vf_map: Dict[str, str] = {
-        "b&w": "hue=s=0",
-        "warm": _chain(
-            f"curves=red='0/0 {0.50}/{0.60+0.20*k:.3f} 1/1'",
-            f"curves=blue='0/0 {0.40}/{0.30-0.20*k:.3f} 1/1'",
-            f"eq=saturation={1+0.05*k:.3f}",
-        ),
-        "cool": _chain(
-            f"curves=blue='0/0 {0.50}/{0.60+0.20*k:.3f} 1/1'",
-            f"curves=red='0/0 {0.40}/{0.30-0.20*k:.3f} 1/1'",
-            f"eq=saturation={1+0.03*k:.3f}",
-        ),
-        "boost": _chain(
-            f"eq=contrast={1+0.25*k:.3f}:saturation={1+0.25*k:.3f}:brightness={0.02*k:.3f}",
-            "unsharp",
-        ),
-		"cinematic": _chain(
-			f"eq=contrast={1+0.12*k:.3f}:saturation={1+0.12*k:.3f}",
-			f"gblur=sigma={0.30+0.70*k:.3f}",
-			"unsharp",
-			"vignette",
-		),
-		"teal_orange": _chain(
-			f"colorbalance=bs={-0.20*k:.3f}:gs=0:rs={0.10*k:.3f}",
-			f"eq=saturation={1+0.10*k:.3f}",
-			"vignette",
-		),
-		"vignette": _chain(
-			"vignette",
-		),		
-		"matte": _chain(
-            f"eq=contrast={1-0.18*k:.3f}:saturation={1-0.05*k:.3f}",
-        ),
-        "pastel": _chain(
-            f"eq=contrast={1-0.15*k:.3f}:saturation={1+0.05*k:.3f}",
-            f"gblur=sigma={1.00+2.00*k:.3f}",
-        ),
-        "hdr": _chain(
-            f"unsharp=luma_msize_x=7:luma_msize_y=7:luma_amount={1.0+1.2*k:.3f}",
-            f"eq=contrast={1+0.20*k:.3f}",
-        ),
-        "sepia": _chain(
-            "colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131:0:0:0:0:1",
-            f"eq=contrast={1-0.18*k:.3f}:saturation={1-0.05*k:.3f}",
-        ),
-        "bleach_bypass": _chain(
-            f"eq=saturation={1-0.35*k:.3f}:contrast={1+0.30*k:.3f}",
-            f"noise=alls={5+20*k:.0f}:allf=t+u",
-        ),
-        "grain": _chain(
-            f"noise=alls={10+50*k:.0f}:allf=t+u",
-        ),
-        "clarity": _chain(
-            f"unsharp=luma_msize_x=7:luma_msize_y=7:luma_amount={1.0+1.8*k:.3f}",
-        ),
-        "fade_soft": _chain(
-            f"eq=contrast={1-0.12*k:.3f}:saturation={1-0.08*k:.3f}:brightness={0.01*k:.3f}",
-            f"gblur=sigma={0.50+1.00*k:.3f}",
-        ),
-        "deband": _chain(
-            f"gradfun=strength={0.50+0.80*k:.3f}",
-        ),
-    }
+        def _vignette(base: Image.Image, strength: float) -> Image.Image:
+            w, h = base.size
+            pad = int(min(w, h) * (0.15 + 0.25 * strength))
+            m = Image.new("L", (w, h), 0)
+            draw = ImageDraw.Draw(m)
+            draw.ellipse((pad, pad, w - pad, h - pad), fill=255)
+            m = m.filter(ImageFilter.GaussianBlur(radius=int(min(w, h) * (0.06 + 0.12 * strength))))
+            dark = ImageEnhance.Brightness(base).enhance(1 - 0.25 * strength)
+            return Image.composite(dark, base, m)
 
-    vf = vf_map.get(pkey, vf_map["cinematic"])
+        preset = (preset or "").lower().strip()
 
-    # 4) определяем поддержку фильтров ffmpeg
-    def _filters_supported(names: list) -> dict:
-        try:
-            info = _ff_filters_supported(names)  # если есть системная утилита
-            return {k: bool(info.get(k)) for k in names}
-        except Exception:
-            # запасной способ — парсим вывод ffmpeg -filters
-            out = subprocess.run([FFMPEG, "-hide_banner", "-filters"],
-                                 capture_output=True, text=True)
-            txt = (out.stdout or "") + (out.stderr or "")
-            return {name: (name in txt) for name in names}
+        if preset in ("b&w", "bw", "mono", "blackwhite"):
+            out_img = img.convert("L").convert("RGB")
 
-    supp = _filters_supported(["gblur", "boxblur", "vignette"])
+        elif preset in ("warm", "warmth"):
+            r, g, b = img.split()
+            r = ImageEnhance.Brightness(r).enhance(1 + 0.15 * k)
+            b = ImageEnhance.Brightness(b).enhance(1 - 0.10 * k)
+            out_img = Image.merge("RGB", (r, g, b))
+            out_img = ImageEnhance.Color(out_img).enhance(1 + 0.10 * k)
 
-    # 5) подготовим флаги и вспомогалки для подмен
-    gblur_fallback_used = False
-    vignette_paramless_used = False
-    vignette_removed = False
+        elif preset in ("cool", "cold"):
+            r, g, b = img.split()
+            b = ImageEnhance.Brightness(b).enhance(1 + 0.15 * k)
+            r = ImageEnhance.Brightness(r).enhance(1 - 0.10 * k)
+            out_img = Image.merge("RGB", (r, g, b))
+            out_img = ImageEnhance.Color(out_img).enhance(1 + 0.05 * k)
 
-    # helper: заменяем gblur=sigma=X -> boxblur=R:P (R≈2*X+0.5, P=1)
-    def _gblur_to_boxblur(s: str) -> str:
-        def _g2b(m):
-            sigma = float(m.group(1))
-            radius = max(0.1, round(2.0 * sigma + 0.5, 2))
-            return f"boxblur={radius}:1"
-        return re.sub(r"gblur\s*=\s*sigma\s*=\s*([0-9]*\.?[0-9]+)", _g2b, s)
+        elif preset in ("boost", "pop"):
+            out_img = ImageEnhance.Contrast(img).enhance(1 + 0.35 * k)
+            out_img = ImageEnhance.Color(out_img).enhance(1 + 0.35 * k)
+            out_img = ImageEnhance.Sharpness(out_img).enhance(1 + 0.25 * k)
 
-    # 6) фолбэк для gblur
-    if "gblur" in vf and not supp.get("gblur", False):
-        if supp.get("boxblur", False):
-            vf = _gblur_to_boxblur(vf)
-            gblur_fallback_used = True
+        elif preset in ("cinematic", "cinema", "film"):
+            out_img = ImageEnhance.Contrast(img).enhance(1 + 0.15 * k)
+            out_img = ImageEnhance.Color(out_img).enhance(1 + 0.12 * k)
+            out_img = out_img.filter(ImageFilter.GaussianBlur(radius=0.5 * k))
+            out_img = ImageEnhance.Sharpness(out_img).enhance(1 + 0.2 * k)
+            out_img = _vignette(out_img, 0.5 * k)
+
+        elif preset in ("teal_orange", "teal-orange", "tealorange"):
+            out_img = ImageEnhance.Contrast(img).enhance(1 + 0.10 * k)
+            out_img = ImageEnhance.Color(out_img).enhance(1 + 0.10 * k)
+            out_img = _blend_color(out_img, (0, 128, 128), 0.08 * k)
+            out_img = _blend_color(out_img, (255, 140, 0), 0.06 * k)
+            out_img = _vignette(out_img, 0.35 * k)
+
+        elif preset in ("pastel", "soft"):
+            out_img = ImageEnhance.Contrast(img).enhance(1 - 0.15 * k)
+            out_img = ImageEnhance.Color(out_img).enhance(1 + 0.05 * k)
+            glow = out_img.filter(ImageFilter.GaussianBlur(radius=2 + 4 * k))
+            out_img = Image.blend(out_img, glow, 0.25 * k)
+
+        elif preset in ("matte", "fade"):
+            out_img = ImageEnhance.Contrast(img).enhance(1 - 0.20 * k)
+            out_img = _blend_color(out_img, (20, 20, 20), 0.10 * k)
+            out_img = ImageEnhance.Color(out_img).enhance(1 - 0.05 * k)
+
+        elif preset in ("hdr", "hdrish", "detail"):
+            out_img = ImageEnhance.Sharpness(img).enhance(1 + 0.6 * k)
+            out_img = ImageEnhance.Contrast(out_img).enhance(1 + 0.20 * k)
+            local = out_img.filter(ImageFilter.DETAIL)
+            out_img = Image.blend(out_img, local, 0.35 * k)
+
+        elif preset in ("sepia",):
+            gray = img.convert("L")
+            out_img = Image.merge("RGB", (gray, gray, gray))
+            out_img = _blend_color(out_img, (112, 66, 20), 0.35 * k)
+            out_img = ImageEnhance.Contrast(out_img).enhance(1 + 0.05 * k)
+
+        elif preset in ("vintage",):
+            out_img = ImageEnhance.Color(img).enhance(1 - 0.15 * k)
+            out_img = _blend_color(out_img, (230, 210, 180), 0.12 * k)
+            out_img = _vignette(out_img, 0.45 * k)
+
+        elif preset in ("clarity", "structure"):
+            hi = ImageEnhance.Sharpness(img).enhance(1 + 0.8 * k)
+            lo = img.filter(ImageFilter.GaussianBlur(radius=1 + 2 * k))
+            out_img = Image.blend(hi, lo, 0.15 * k)
+            out_img = ImageEnhance.Contrast(out_img).enhance(1 + 0.10 * k)
+
         else:
-            # ни gblur, ни boxblur — удаляем сегмент gblur=...
-            vf = re.sub(r"(,)?gblur\s*=\s*[^,]+(,)?", lambda m: "," if m.group(1) and m.group(2) else "", vf).strip(",")
-            gblur_fallback_used = True  # считаем как фолбэк
+            out_img = ImageEnhance.Contrast(img).enhance(1 + 0.12 * k)
+            out_img = ImageEnhance.Color(out_img).enhance(1 + 0.10 * k)
+            out_img = out_img.filter(ImageFilter.GaussianBlur(radius=0.3 * k))
 
-    # 7) деградация vignette: если фильтр есть, но нет опций strength/radius — оставляем без параметров;
-    #    если фильтра нет — удаляем совсем.
-    def _filter_has_option(fname: str, opt: str) -> bool:
-        try:
-            out = subprocess.run([FFMPEG, "-hide_banner", "-h", f"filter={fname}"],
-                                 capture_output=True, text=True, timeout=5)
-            txt = (out.stdout or "") + (out.stderr or "")
-            return (opt in txt)
-        except Exception:
-            # если не смогли проверить — лучше вернуть False, чтобы не падать на рантайме
-            return False
+        out = OUT_DIR / _uuid_name("flt_img_out", ".jpg")
+        out_img.save(out, quality=92, optimize=True, progressive=True)
+        return {"ok": True, "preset": preset, "intensity": k, "output_url": _public_url(out)}
+    except Exception as e:
+        return {"ok": False, "stage": "filter", "error": str(e)}
 
-    if "vignette" in vf:
-        if supp.get("vignette", False):
-            has_strength = _filter_has_option("vignette", "strength")
-            has_radius = _filter_has_option("vignette", "radius")
-            if not (has_strength and has_radius):
-                # заменяем любой 'vignette=...' на просто 'vignette'
-                new_vf = re.sub(r"vignette\s*=\s*[^,]+", "vignette", vf)
-                if new_vf != vf:
-                    vf = new_vf
-                    vignette_paramless_used = True
-        else:
-            # фильтра нет — аккуратно удаляем сегменты с учетом запятых
-            vf = re.sub(r"(,)?vignette\s*(=\s*[^,]+)?(,)?",
-                        lambda m: "," if m.group(1) and m.group(3) else "", vf).strip(",")
-            vignette_removed = True
 
-    # 8) финальная нормализация формата
-    vf = _chain(vf, "format=yuv420p")
+# NEW: ставим задачу на фоновую обработку видео
+@app.post("/media/filter/video")
+async def enqueue_filter_video(body: dict = Body(...)):
+    """
+    Ставит задачу на фоновую обработку видео.
+    Вход: { "url": "...", "preset": "cinematic", "intensity": 0.7 }
+    Выход: { ok, job_id, status_url }
+    """
+    url = body.get("url")
+    preset = body.get("preset")
+    intensity = body.get("intensity", 0.7)
 
-    # 9) запуск ffmpeg
-    out_path = OUT_DIR / _uuid_name("flt_vid_out", ".mp4")
-    cmd = [
-        FFMPEG, "-y", "-i", str(src),
-        "-vf", vf,
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
-        "-c:a", "aac", "-b:a", "128k",
-        "-movflags", "+faststart",
-        str(out_path)
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if not url:
+        raise HTTPException(status_code=400, detail="Field 'url' is required")
+    if preset is None:
+        raise HTTPException(status_code=400, detail="Field 'preset' is required")
 
-    if proc.returncode != 0:
-        return {
-            "ok": False,
-            "stage": "ffmpeg",
-            "stderr": proc.stderr[-2000:],  # хвост для диагностики
-            "vf": vf,
-            "preset": pkey,
-            "intensity": k,
-            "gblur_fallback": gblur_fallback_used,
-            "vignette_paramless": vignette_paramless_used,
-            "vignette_removed": vignette_removed,
-        }
+    payload = {"url": url, "preset": preset, "intensity": float(intensity)}
+    job_id = create_job(kind="video_filter", payload=payload)
+    await job_queue.put(job_id)
 
     return {
         "ok": True,
-        "preset": pkey,
-        "intensity": k,
-        "vf": vf,
-        "gblur_fallback": gblur_fallback_used,
-        "vignette_paramless": vignette_paramless_used,
-        "vignette_removed": vignette_removed,
-        "output_url": _public_url(out_path),
-    }         
+        "job_id": job_id,
+        "status_url": f"/media/filter/status?job_id={job_id}",
+    }
+
+
+@app.get("/media/filter/status")
+async def media_filter_status(job_id: str):
+    """
+    Возвращает статус и (при успехе) результат обработки.
+    """
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    data = {
+        "ok": True,
+        "job_id": job_id,
+        "kind": job.get("kind"),
+        "status": job.get("status"),
+        "created_at": job.get("created_at"),
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+    }
+    if job.get("status") == JobStatus.DONE:
+        data["result"] = job.get("result")
+    if job.get("status") == JobStatus.ERROR:
+        data["error"] = job.get("error")
+    return data
 
             
 # 7) COMPOSITE COVER
@@ -1862,6 +2015,7 @@ def root():
             "/media/watermark",
             "/media/filter/image",
             "/media/filter/video",
+            "/media/filter/status",
             "/media/composite/cover",
             "/ig/schedule",
             "/caption/suggest",
