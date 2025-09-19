@@ -872,7 +872,7 @@ async def auth_refresh_token(current_token: Optional[str] = Body(None, embed=Tru
         raise HTTPException(500, "META_APP_ID / META_APP_SECRET are not set.")
 
     async with RetryClient() as client:        
-	r = await client.get(
+    r = await client.get(
             TOKEN_URL,
             params={
                 "grant_type": "fb_exchange_token",
@@ -1036,13 +1036,13 @@ async def ig_comment(
             r = await client.post(
                 f"{GRAPH_BASE}/{reply_to_comment_id}/replies",
                 data={"access_token": st["page_token"], "message": message},
-			retries=4,
+            retries=4,
             )
         else:
             r = await client.post(
                 f"{GRAPH_BASE}/{media_id}/comments",
                 data={"access_token": st["page_token"], "message": message},
-		retries=4,
+        retries=4,
             )
         r.raise_for_status()
     return {"ok": True, "result": r.json()}
@@ -1236,29 +1236,29 @@ async def ig_media_insights(
 ):
     st = await _load_state()
     async with RetryClient() as client:        # media_type
-    	r1 = await client.get(
-        	f"{GRAPH_BASE}/{media_id}",
-        	params={"fields": "media_type", "access_token": st["page_token"]},
-        	retries=4,
-    	)
-    	try:
-        	r1.raise_for_status()
-        	media_type = (r1.json() or {}).get("media_type", "")
-    	except httpx.HTTPStatusError as e:
-        	return {"ok": False, "stage": "get_media_type", "status": e.response.status_code, "error": e.response.json()}
+        r1 = await client.get(
+            f"{GRAPH_BASE}/{media_id}",
+            params={"fields": "media_type", "access_token": st["page_token"]},
+            retries=4,
+        )
+        try:
+            r1.raise_for_status()
+            media_type = (r1.json() or {}).get("media_type", "")
+        except httpx.HTTPStatusError as e:
+            return {"ok": False, "stage": "get_media_type", "status": e.response.status_code, "error": e.response.json()}
 
-    	# product_type (мягкая попытка)
-   	product_type = None
-   	try:
-        	r2 = await client.get(
-           	f"{GRAPH_BASE}/{media_id}",
-           	params={"fields": "product_type", "access_token": st["page_token"]},
-           	retries=4,
-        	)
-        	if r2.status_code == 200:
-            		product_type = (r2.json() or {}).get("product_type")
-    	except Exception:
-        	pass
+        # product_type (мягкая попытка)
+    product_type = None
+    try:
+            r2 = await client.get(
+            f"{GRAPH_BASE}/{media_id}",
+            params={"fields": "product_type", "access_token": st["page_token"]},
+            retries=4,
+            )
+            if r2.status_code == 200:
+                    product_type = (r2.json() or {}).get("product_type")
+        except Exception:
+            pass
 
         mt_upper = (product_type or media_type or "").upper()
         req_metrics = [m.strip() for m in metrics.split(",") if m.strip()] if metrics else _pick_metrics_for_media(mt_upper)
@@ -1302,7 +1302,7 @@ async def ig_account_insights(
     if bad:
         raise HTTPException(400, f"Unsupported metrics: {bad}. Allowed: {sorted(ACCOUNT_INSIGHT_ALLOWED)}")
     async with RetryClient() as client:        
-	r = await client.get(
+    r = await client.get(
             f"{GRAPH_BASE}/{st['ig_id']}/insights",
             params={"metric": ",".join(req_metrics), "period": period, "access_token": st["page_token"]},
             retries=4,
@@ -1354,7 +1354,7 @@ async def ig_comment_after_publish(
 ):
     st = await _load_state()
     async with RetryClient() as client:        
-	r = await client.post(
+    r = await client.post(
             f"{GRAPH_BASE}/{media_id}/comments",
             data={"message": message, "access_token": st["page_token"]},
             retries=4,
@@ -1470,34 +1470,34 @@ async def flow_filter_and_publish(
     try:
     # Превращаем output_url в абсолютный локальный путь
     # Пример output_url: "/static/out/flt_vid_out_xxx.mp4"
-    	rel = None
-    	if out_url_local.startswith("/static/"):
-        	rel = out_url_local[len("/static/"):]  # "out/xxx.mp4"
-        	local_path = STATIC_DIR / rel
-    	else:
+        rel = None
+        if out_url_local.startswith("/static/"):
+            rel = out_url_local[len("/static/"):]  # "out/xxx.mp4"
+            local_path = STATIC_DIR / rel
+        else:
         # на всякий случай: возьмём basename и посмотрим в OUT_DIR
-        	local_path = OUT_DIR / Path(out_url_local).name
+            local_path = OUT_DIR / Path(out_url_local).name
 
-    	if not local_path.exists():
-        	return {
-            		"ok": False,
-            		"stage": "cloudinary",
-            		"error": f"local file not found: {local_path} (from output_url={out_url_local})"
-        	}
+        if not local_path.exists():
+            return {
+                    "ok": False,
+                    "stage": "cloudinary",
+                    "error": f"local file not found: {local_path} (from output_url={out_url_local})"
+            }
 
-	cld_resp = await _cloudinary_unsigned_upload_file(
-        	local_path,
-        	resource_type="video",
-        	folder=cloudinary_folder,
-    	)
-    	secure_url = cld_resp.get("secure_url")
-    	if not secure_url:
-        	return {"ok": False, "stage": "cloudinary", "error": "no secure_url in Cloudinary response"}
+    cld_resp = await _cloudinary_unsigned_upload_file(
+            local_path,
+            resource_type="video",
+            folder=cloudinary_folder,
+        )
+        secure_url = cld_resp.get("secure_url")
+        if not secure_url:
+            return {"ok": False, "stage": "cloudinary", "error": "no secure_url in Cloudinary response"}
 
     except HTTPException as he:
-    	raise he
+        raise he
     except Exception as e:
-    	return {"ok": False, "stage": "cloudinary", "error": str(e)}
+        return {"ok": False, "stage": "cloudinary", "error": str(e)}
 
     # 4) publish to IG (используем наш уже существующий обработчик)
     try:
@@ -2279,7 +2279,7 @@ async def _publish_job(job_id: str, ig_id: str, page_token: str, creation_id: st
     if JOBS.get(job_id, {}).get("status") == "canceled":
         return
     async with RetryClient() as client:        
-	try:
+    try:
             r = await client.post(
                 f"{GRAPH_BASE}/{ig_id}/media_publish",
                 data={"creation_id": creation_id, "access_token": page_token},
