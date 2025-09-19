@@ -474,7 +474,7 @@ async def _download_to(url: str, dst_path: Path) -> Path:
         "User-Agent": "ig-planner/1.0 (+https://ig-planner-backend.onrender.com)",
         "Accept": "*/*",
     }
-    async with httpx.AsyncClient(timeout=120, headers=headers, follow_redirects=True) as client:
+    async with÷ (timeout=120, headers=headers, follow_redirects=True) as client:
         r = await client.get(url)
         try:
             r.raise_for_status()
@@ -485,6 +485,27 @@ async def _download_to(url: str, dst_path: Path) -> Path:
             raise RuntimeError(f"Download failed ({status}) {url}{hint}") from None
         dst_path.write_bytes(r.content)
     return dst_path
+
+# --- HTTP client with retries -------------------------------------------------
+import random
+
+DEFAULT_TIMEOUT = httpx.Timeout(connect=10, read=30, write=30, pool=30)
+
+class RetryClient(httpx.AsyncClient):
+    async def request(self, method, url, *args, retries: int = 3, backoff: float = 0.5, **kwargs):
+        attempt = 0
+        while True:
+            try:
+                return await super().request(
+                    method, url, *args,
+                    timeout=kwargs.pop("timeout", DEFAULT_TIMEOUT),
+                    **kwargs
+                )
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteError, httpx.RemoteProtocolError) as e:
+                attempt += 1
+                if attempt > retries:
+                    raise
+                await asyncio.sleep(backoff * (2 ** (attempt - 1)) + random.uniform(0, 0.2))
 
 def _uuid_name(prefix: str, ext: str) -> str:
     ext = ext if ext.startswith(".") else f".{ext}"
@@ -654,9 +675,9 @@ def _pick_font(size: int = 48, name: Optional[str] = None) -> "ImageFont.FreeTyp
     return ImageFont.load_default()
 
 # ── LIVE state: берём всё из ENV и Graph API ────────────────────────────
-async def _resolve_page_and_ig_id(client: httpx.AsyncClient) -> Dict[str, str]:
+async def _resolve_page_and_ig_id(client: RetryClient) -> Dict[str, Any]:
     """
-    Возвращает page_id и ig_id (instagram_business_account.id), не используя tokens.json.
+    Возвращает page_id, ig_id (instagram_business_account.id) и ig_username.
     1) Если PAGE_ID задан в ENV — используем его.
     2) Иначе берём первую доступную страницу из /me/accounts.
     """
@@ -666,30 +687,73 @@ async def _resolve_page_and_ig_id(client: httpx.AsyncClient) -> Dict[str, str]:
     # 1) page_id
     page_id = PAGE_ID_ENV
     if not page_id:
-        r = await client.get(f"{META_GRAPH}/me/accounts", params={"access_token": IG_LONG_TOKEN, "limit": 50})
-        j = r.json()
-        if r.status_code != 200:
-            raise HTTPException(r.status_code, f"/me/accounts failed: {j}")
-        pages = j.get("data") or []
+        r = await client.get(
+            f"{ME_URL}/accounts",
+            params={"access_token": IG_LONG_TOKEN, "fields": "id,name,access_token"},
+            retries=4,
+        )
+        r.raise_for_status()
+        pages = r.json().get("data") or []
         if not pages:
             raise HTTPException(400, "No Pages available for this token.")
         page_id = pages[0]["id"]
 
-    # 2) ig_id
-    r2 = await client.get(f"{META_GRAPH}/{page_id}", params={
-        "fields": "instagram_business_account{id,username}",
-        "access_token": IG_LONG_TOKEN
-    })
-    j2 = r2.json()
-    if r2.status_code != 200:
-        raise HTTPException(r2.status_code, f"/{page_id} failed: {j2}")
-
-    ig = (j2.get("instagram_business_account") or {})
+    # 2) ig_id + username
+    r2 = await client.get(
+        f"{GRAPH_BASE}/{page_id}",
+        params={"fields": "instagram_business_account{id,username}", "access_token": IG_LONG_TOKEN},
+        retries=4,
+    )
+    r2.raise_for_status()
+    ig = (r2.json().get("instagram_business_account") or {})
     ig_id = ig.get("id")
+    ig_username = ig.get("username")
     if not ig_id:
         raise HTTPException(400, "This Page has no instagram_business_account linked.")
 
-    return {"page_id": page_id, "ig_id": ig_id, "ig_username": ig.get("username")}
+    return {"page_id": page_id, "ig_id": ig_id, "ig_username": ig_username}
+
+async def _resolve_page_and_ig_id(client: RetryClient) -> Dict[str, Any]:
+    # запрашиваем страницы пользователя
+    r = await client.get(
+        f"{ME_URL}/accounts",
+        params={"access_token": IG_LONG_TOKEN, "fields": "id,name,access_token"},
+        retries=4,
+    )
+    r.raise_for_status()
+    pages = r.json().get("data", [])
+    if not pages:
+        raise HTTPException(400, "No pages found")
+
+    page = pages[0]
+    page_id = page["id"]
+
+    # получаем IG аккаунт этой страницы
+    r2 = await client.get(
+        f"{GRAPH_BASE}/{page_id}",
+        params={"fields": "instagram_business_account", "access_token": IG_LONG_TOKEN},
+        retries=4,
+    )
+    r2.raise_for_status()
+    ig_id = (r2.json().get("instagram_business_account") or {}).get("id")
+    if not ig_id:
+        raise HTTPException(400, "No Instagram business account linked")
+
+    # получаем имя IG
+    r3 = await client.get(
+        f"{GRAPH_BASE}/{ig_id}",
+        params={"fields": "username", "access_token": IG_LONG_TOKEN},
+        retries=4,
+    )
+    r3.raise_for_status()
+    ig_username = (r3.json() or {}).get("username")
+
+    return {
+        "page_id": page_id,
+        "ig_id": ig_id,
+        "ig_username": ig_username,
+    }
+
 
 async def _load_state() -> Dict[str, Any]:
     """
@@ -697,7 +761,7 @@ async def _load_state() -> Dict[str, Any]:
     - page_access_token = IG_ACCESS_TOKEN (длинный)
     - ig_id из Graph API
     """
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with RetryClient() as client:
         resolved = await _resolve_page_and_ig_id(client)
         return {
             "ig_id": resolved["ig_id"],
@@ -707,7 +771,7 @@ async def _load_state() -> Dict[str, Any]:
             "ig_username": resolved["ig_username"],
         }
 
-# ── Healthcheck ────────────────────────────────────────────────────────
+# ── Healthcheck ──────────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {"ok": True, "ffmpeg": _has_ffmpeg(), "pillow": PIL_OK}
@@ -736,14 +800,15 @@ async def oauth_callback(code: Optional[str] = None, state: Optional[str] = None
         raise HTTPException(400, "Invalid state or code")
     STATE_STORE.discard(state)
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        # 1) code -> short-lived user token
+    async with RetryClient() as client:        # 1) code -> short-lived user token
         r = await client.get(TOKEN_URL, params={
             "client_id": APP_ID,
             "client_secret": APP_SECRET,
             "redirect_uri": REDIRECT_URI,
             "code": code,
-        })
+        },
+        retries=4,
+)
         r.raise_for_status()
         short = r.json()
 
@@ -806,8 +871,8 @@ async def auth_refresh_token(current_token: Optional[str] = Body(None, embed=Tru
     if not APP_ID or not APP_SECRET:
         raise HTTPException(500, "META_APP_ID / META_APP_SECRET are not set.")
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(
+    async with RetryClient() as client:        
+	r = await client.get(
             TOKEN_URL,
             params={
                 "grant_type": "fb_exchange_token",
@@ -815,6 +880,7 @@ async def auth_refresh_token(current_token: Optional[str] = Body(None, embed=Tru
                 "client_secret": APP_SECRET,
                 "fb_exchange_token": token_to_refresh,
             },
+            retries=4,
         )
         try:
             r.raise_for_status()
@@ -853,10 +919,11 @@ async def me_pages():
         return {"ok": False, "error": "IG_ACCESS_TOKEN not set"}
 
     out = []
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with RetryClient() as client:
         r = await client.get(
             f"{ME_URL}/accounts",
-            params={"access_token": IG_LONG_TOKEN, "fields": "id,name,access_token"}
+            params={"access_token": IG_LONG_TOKEN, "fields": "id,name,access_token"},
+            retries=4,
         )
         try:
             r.raise_for_status()
@@ -931,8 +998,8 @@ async def ig_media(limit: int = 12, after: Optional[str] = None):
     if after:
         params["after"] = after
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(f"{GRAPH_BASE}/{ig_id}/media", params=params)
+    async with RetryClient() as client:
+        r = await client.get(f"{GRAPH_BASE}/{ig_id}/media", params=params, retries=4)
         r.raise_for_status()
         payload = r.json()
     return {"ok": True, "count": len(payload.get("data", [])), "data": payload.get("data", []), "paging": payload.get("paging", {})}
@@ -941,14 +1008,15 @@ async def ig_media(limit: int = 12, after: Optional[str] = None):
 @app.get("/ig/comments")
 async def ig_comments(media_id: str = Query(...), limit: int = 25):
     st = await _load_state()
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with RetryClient() as client:
         r = await client.get(
             f"{GRAPH_BASE}/{media_id}/comments",
             params={
                 "access_token": st["page_token"],
                 "limit": max(1, min(limit, 50)),
                 "fields": "id,text,username,timestamp"
-            }
+            },
+            retries=4,
         )
         r.raise_for_status()
         payload = r.json()
@@ -963,16 +1031,18 @@ async def ig_comment(
     if not media_id and not reply_to_comment_id:
         raise HTTPException(400, "Provide media_id OR reply_to_comment_id")
     st = await _load_state()
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with RetryClient() as client:
         if reply_to_comment_id:
             r = await client.post(
                 f"{GRAPH_BASE}/{reply_to_comment_id}/replies",
-                data={"access_token": st["page_token"], "message": message}
+                data={"access_token": st["page_token"], "message": message},
+			retries=4,
             )
         else:
             r = await client.post(
                 f"{GRAPH_BASE}/{media_id}/comments",
-                data={"access_token": st["page_token"], "message": message}
+                data={"access_token": st["page_token"], "message": message},
+		retries=4,
             )
         r.raise_for_status()
     return {"ok": True, "result": r.json()}
@@ -1165,23 +1235,30 @@ async def ig_media_insights(
     metrics: Optional[str] = Query(None),
 ):
     st = await _load_state()
-    async with httpx.AsyncClient(timeout=30) as client:
-        # media_type
-        r1 = await client.get(f"{GRAPH_BASE}/{media_id}", params={"fields": "media_type", "access_token": st["page_token"]})
-        try:
-            r1.raise_for_status()
-            media_type = (r1.json() or {}).get("media_type", "")
-        except httpx.HTTPStatusError as e:
-            return {"ok": False, "stage": "get_media_type", "status": e.response.status_code, "error": e.response.json()}
+    async with RetryClient() as client:        # media_type
+    	r1 = await client.get(
+        	f"{GRAPH_BASE}/{media_id}",
+        	params={"fields": "media_type", "access_token": st["page_token"]},
+        	retries=4,
+    	)
+    	try:
+        	r1.raise_for_status()
+        	media_type = (r1.json() or {}).get("media_type", "")
+    	except httpx.HTTPStatusError as e:
+        	return {"ok": False, "stage": "get_media_type", "status": e.response.status_code, "error": e.response.json()}
 
-        # product_type (мягкая попытка)
-        product_type = None
-        try:
-            r2 = await client.get(f"{GRAPH_BASE}/{media_id}", params={"fields": "product_type", "access_token": st["page_token"]})
-            if r2.status_code == 200:
-                product_type = (r2.json() or {}).get("product_type")
-        except Exception:
-            pass
+    	# product_type (мягкая попытка)
+   	product_type = None
+   	try:
+        	r2 = await client.get(
+           	f"{GRAPH_BASE}/{media_id}",
+           	params={"fields": "product_type", "access_token": st["page_token"]},
+           	retries=4,
+        	)
+        	if r2.status_code == 200:
+            		product_type = (r2.json() or {}).get("product_type")
+    	except Exception:
+        	pass
 
         mt_upper = (product_type or media_type or "").upper()
         req_metrics = [m.strip() for m in metrics.split(",") if m.strip()] if metrics else _pick_metrics_for_media(mt_upper)
@@ -1224,10 +1301,11 @@ async def ig_account_insights(
     bad = [m for m in req_metrics if m not in ACCOUNT_INSIGHT_ALLOWED]
     if bad:
         raise HTTPException(400, f"Unsupported metrics: {bad}. Allowed: {sorted(ACCOUNT_INSIGHT_ALLOWED)}")
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(
+    async with RetryClient() as client:        
+	r = await client.get(
             f"{GRAPH_BASE}/{st['ig_id']}/insights",
-            params={"metric": ",".join(req_metrics), "period": period, "access_token": st["page_token"]}
+            params={"metric": ",".join(req_metrics), "period": period, "access_token": st["page_token"]},
+            retries=4,
         )
         r.raise_for_status()
         data = r.json().get("data", [])
@@ -1275,10 +1353,11 @@ async def ig_comment_after_publish(
     message: str = Body(..., embed=True),
 ):
     st = await _load_state()
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(
+    async with RetryClient() as client:        
+	r = await client.post(
             f"{GRAPH_BASE}/{media_id}/comments",
-            data={"message": message, "access_token": st["page_token"]}
+            data={"message": message, "access_token": st["page_token"]},
+            retries=4,
         )
         try:
             r.raise_for_status()
@@ -1386,24 +1465,39 @@ async def flow_filter_and_publish(
     # 3) upload to Cloudinary (unsigned)
     #    Полезно складывать в папку проекта (не обязательно)
     try:
-        # локальный абсолютный путь к файлу
-        local_path = OUT_DIR / Path(out_url_local).name
-        if not local_path.exists():
-            # fallback: если вдруг output_url с путём типа /static/out/..., вытащим basename
-            local_path = next((OUT_DIR / Path(out_url_local).name).glob("*"), OUT_DIR / Path(out_url_local).name)
-        cld_resp = await _cloudinary_unsigned_upload_file(
-            local_path,
-            resource_type="video",
-            folder=cloudinary_folder,
-        )
-        secure_url = cld_resp.get("secure_url")
-        if not secure_url:
-            return {"ok": False, "stage": "cloudinary", "error": "no secure_url in Cloudinary response"}
+
+    # 3) upload to Cloudinary (unsigned)
+    try:
+    # Превращаем output_url в абсолютный локальный путь
+    # Пример output_url: "/static/out/flt_vid_out_xxx.mp4"
+    	rel = None
+    	if out_url_local.startswith("/static/"):
+        	rel = out_url_local[len("/static/"):]  # "out/xxx.mp4"
+        	local_path = STATIC_DIR / rel
+    	else:
+        # на всякий случай: возьмём basename и посмотрим в OUT_DIR
+        	local_path = OUT_DIR / Path(out_url_local).name
+
+    	if not local_path.exists():
+        	return {
+            		"ok": False,
+            		"stage": "cloudinary",
+            		"error": f"local file not found: {local_path} (from output_url={out_url_local})"
+        	}
+
+	cld_resp = await _cloudinary_unsigned_upload_file(
+        	local_path,
+        	resource_type="video",
+        	folder=cloudinary_folder,
+    	)
+    	secure_url = cld_resp.get("secure_url")
+    	if not secure_url:
+        	return {"ok": False, "stage": "cloudinary", "error": "no secure_url in Cloudinary response"}
+
     except HTTPException as he:
-        # Пробрасываем как есть
-        raise he
+    	raise he
     except Exception as e:
-        return {"ok": False, "stage": "cloudinary", "error": str(e)}
+    	return {"ok": False, "stage": "cloudinary", "error": str(e)}
 
     # 4) publish to IG (используем наш уже существующий обработчик)
     try:
@@ -1897,131 +1991,6 @@ async def media_watermark(
 
 # 6) FILTERS (image/video)
 @app.post("/media/filter/image")
-async def media_filter_image_v2(
-    url: str = Body(..., embed=True),
-    preset: str = Body("cinematic", embed=True),
-    intensity: float = Body(0.7, embed=True),
-):
-    if not PIL_OK:
-        return {"ok": False, "error": "Pillow not installed."}
-    try:
-        src = UPLOAD_DIR / _uuid_name("flt_img", _ext_from_url(url, ".jpg"))
-        await _download_to(url, src)
-        img = Image.open(src).convert("RGB")
-    except Exception as e:
-        return {"ok": False, "stage": "download/open", "error": str(e)}
-
-    # clamp 0..1
-    k = max(0.0, min(1.0, float(intensity)))
-
-    try:
-        out_img = img
-
-        def _blend_color(base: Image.Image, rgb: tuple, alpha: float) -> Image.Image:
-            overlay = Image.new("RGB", base.size, rgb)
-            return Image.blend(base, overlay, max(0.0, min(1.0, alpha)))
-
-        def _vignette(base: Image.Image, strength: float) -> Image.Image:
-            # сила 0..1 -> радиус и размытие
-            w, h = base.size
-            pad = int(min(w, h) * (0.15 + 0.25 * strength))  # ширина "перетемнения" по краям
-            # маска: белый центр, чёрные края (после blur)
-            m = Image.new("L", (w, h), 0)
-            draw = ImageDraw.Draw(m)
-            draw.ellipse((pad, pad, w - pad, h - pad), fill=255)
-            m = m.filter(ImageFilter.GaussianBlur(radius=int(min(w, h) * (0.06 + 0.12 * strength))))
-            # затемняем копию и смешиваем по маске (инвертированной)
-            dark = ImageEnhance.Brightness(base).enhance(1 - 0.25 * strength)
-            return Image.composite(dark, base, m)  # светлый центр (маска белая) остаётся из base
-
-        preset = (preset or "").lower().strip()
-
-        if preset in ("b&w", "bw", "mono", "blackwhite"):
-            out_img = img.convert("L").convert("RGB")
-
-        elif preset in ("warm", "warmth"):
-            r, g, b = img.split()
-            r = ImageEnhance.Brightness(r).enhance(1 + 0.15 * k)
-            b = ImageEnhance.Brightness(b).enhance(1 - 0.10 * k)
-            out_img = Image.merge("RGB", (r, g, b))
-            out_img = ImageEnhance.Color(out_img).enhance(1 + 0.10 * k)
-
-        elif preset in ("cool", "cold"):
-            r, g, b = img.split()
-            b = ImageEnhance.Brightness(b).enhance(1 + 0.15 * k)
-            r = ImageEnhance.Brightness(r).enhance(1 - 0.10 * k)
-            out_img = Image.merge("RGB", (r, g, b))
-            out_img = ImageEnhance.Color(out_img).enhance(1 + 0.05 * k)
-
-        elif preset in ("boost", "pop"):
-            out_img = ImageEnhance.Contrast(img).enhance(1 + 0.35 * k)
-            out_img = ImageEnhance.Color(out_img).enhance(1 + 0.35 * k)
-            out_img = ImageEnhance.Sharpness(out_img).enhance(1 + 0.25 * k)
-
-        elif preset in ("cinematic", "cinema", "film"):
-            out_img = ImageEnhance.Contrast(img).enhance(1 + 0.15 * k)
-            out_img = ImageEnhance.Color(out_img).enhance(1 + 0.12 * k)
-            # лёгкое размытие + усиление резкости даёт «кино» мягкость
-            out_img = out_img.filter(ImageFilter.GaussianBlur(radius=0.5 * k))
-            out_img = ImageEnhance.Sharpness(out_img).enhance(1 + 0.2 * k)
-            out_img = _vignette(out_img, 0.5 * k)
-
-        elif preset in ("teal_orange", "teal-orange", "tealorange"):
-            # холодные тени (teal), тёплые света (orange) через мягкий overlay
-            out_img = ImageEnhance.Contrast(img).enhance(1 + 0.10 * k)
-            out_img = ImageEnhance.Color(out_img).enhance(1 + 0.10 * k)
-            out_img = _blend_color(out_img, (0, 128, 128), 0.08 * k)  # teal в тени
-            out_img = _blend_color(out_img, (255, 140, 0), 0.06 * k)  # orange в светах
-            out_img = _vignette(out_img, 0.35 * k)
-
-        elif preset in ("pastel", "soft"):
-            out_img = ImageEnhance.Contrast(img).enhance(1 - 0.15 * k)
-            out_img = ImageEnhance.Color(out_img).enhance(1 + 0.05 * k)
-            glow = out_img.filter(ImageFilter.GaussianBlur(radius=2 + 4 * k))
-            out_img = Image.blend(out_img, glow, 0.25 * k)
-
-        elif preset in ("matte", "fade"):
-            out_img = ImageEnhance.Contrast(img).enhance(1 - 0.20 * k)
-            out_img = _blend_color(out_img, (20, 20, 20), 0.10 * k)  # подъём чёрной точки
-            out_img = ImageEnhance.Color(out_img).enhance(1 - 0.05 * k)
-
-        elif preset in ("hdr", "hdrish", "detail"):
-            out_img = ImageEnhance.Sharpness(img).enhance(1 + 0.6 * k)
-            out_img = ImageEnhance.Contrast(out_img).enhance(1 + 0.20 * k)
-            local = out_img.filter(ImageFilter.DETAIL)
-            out_img = Image.blend(out_img, local, 0.35 * k)
-
-        elif preset in ("sepia",):
-            gray = img.convert("L")
-            out_img = Image.merge("RGB", (gray, gray, gray))
-            out_img = _blend_color(out_img, (112, 66, 20), 0.35 * k)
-            out_img = ImageEnhance.Contrast(out_img).enhance(1 + 0.05 * k)
-
-        elif preset in ("vintage",):
-            out_img = ImageEnhance.Color(img).enhance(1 - 0.15 * k)
-            out_img = _blend_color(out_img, (230, 210, 180), 0.12 * k)
-            out_img = _vignette(out_img, 0.45 * k)
-
-        elif preset in ("clarity", "structure"):
-            hi = ImageEnhance.Sharpness(img).enhance(1 + 0.8 * k)
-            lo = img.filter(ImageFilter.GaussianBlur(radius=1 + 2 * k))
-            out_img = Image.blend(hi, lo, 0.15 * k)
-            out_img = ImageEnhance.Contrast(out_img).enhance(1 + 0.10 * k)
-
-        else:
-            # дефолт «слегка лучше, чем оригинал»
-            out_img = ImageEnhance.Contrast(img).enhance(1 + 0.12 * k)
-            out_img = ImageEnhance.Color(out_img).enhance(1 + 0.10 * k)
-            out_img = out_img.filter(ImageFilter.GaussianBlur(radius=0.3 * k))
-
-        out = OUT_DIR / _uuid_name("flt_img_out", ".jpg")
-        out_img.save(out, quality=92, optimize=True, progressive=True)
-        return {"ok": True, "preset": preset, "intensity": k, "output_url": _public_url(out)}
-    except Exception as e:
-        return {"ok": False, "stage": "filter", "error": str(e)}
-
-# 6) FILTERS (image/video)
-@app.post("/media/filter/image")
 async def media_filter_image(
     url: str = Body(..., embed=True),
     preset: str = Body("cinematic", embed=True),
@@ -2309,11 +2278,12 @@ async def _publish_job(job_id: str, ig_id: str, page_token: str, creation_id: st
     await asyncio.sleep(wait)
     if JOBS.get(job_id, {}).get("status") == "canceled":
         return
-    async with httpx.AsyncClient(timeout=30) as client:
-        try:
+    async with RetryClient() as client:        
+	try:
             r = await client.post(
                 f"{GRAPH_BASE}/{ig_id}/media_publish",
-                data={"creation_id": creation_id, "access_token": page_token}
+                data={"creation_id": creation_id, "access_token": page_token},
+            retries=4,
             )
             r.raise_for_status()
             JOBS[job_id]["status"] = "done"
