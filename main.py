@@ -1,4 +1,4 @@
-import os, secrets, json, time, asyncio, uuid, subprocess, textwrap, shutil
+import os, secrets, json, time, asyncio, uuid, re, subprocess, textwrap, shutil
 from jobs import create_job, get_job, update_job_status, PENDING, RUNNING, DONE, ERROR
 from typing import Optional, List, Dict, Any
 from urllib.parse import urlencode
@@ -190,42 +190,43 @@ async def _worker_loop():
             update_job_status(job_id, ERROR, error=str(e))
         finally:
             job_queue.task_done()
+
 async def _process_video_task(job_id: str, payload: Dict) -> Dict:
     """
-    Обработчик задачи: скачивает видео, применяет фильтры через ffmpeg,
-    обновляет промежуточные статусы (downloading, preparing, encoding),
-    и возвращает dict с результатом.
+    Скачивает видео, собирает цепочку фильтров и прогоняет ffmpeg,
+    обновляя прогресс в jobs: downloading → preparing → encoding (с % до 100).
+    Требуются хелперы/константы: _has_ffmpeg, _download_to, _uuid_name,
+    _ext_from_url, _ffmpeg_has_filter, _public_url, _ffprobe_json,
+    а также FFMPEG, UPLOAD_DIR, OUT_DIR, update_job_status.
     """
-    import re
+    # --- импорт локальный на всякий
     import subprocess
 
-    # --- stage: downloading ---
+    # 0) старт: объявим прогресс
     update_job_status(job_id, RUNNING, result={"stage": "downloading", "progress": 10})
 
     url = payload["url"]
     preset = payload.get("preset", "cinematic")
     intensity = float(payload.get("intensity", 0.7))
 
-    if not _has_ffmpeg():  # type: ignore[name-defined]
+    if not _has_ffmpeg():
+        update_job_status(job_id, ERROR, error="ffmpeg not available")
         raise RuntimeError("ffmpeg not available")
 
-    # скачиваем исходник
-    src = UPLOAD_DIR / _uuid_name("flt_vid", _ext_from_url(url, ".mp4"))  # type: ignore[name-defined]
-    await _download_to(url, src)  # type: ignore[name-defined]
-
-    # --- stage: preparing filters ---
+    # 1) скачать исходник
+    src = UPLOAD_DIR / _uuid_name("flt_vid", _ext_from_url(url, ".mp4"))
+    await _download_to(url, src)
     update_job_status(job_id, RUNNING, result={"stage": "preparing_filters", "progress": 30})
 
-    # нормализуем интенсивность
+    # 2) нормализуем интенсивность
     k = max(0.0, min(1.0, intensity))
 
-    # хелпер для сборки vf-цепочки
     def _chain(*filters: str) -> str:
         return ",".join([f for f in filters if f and str(f).strip()])
 
     pkey = (preset or "cinematic").lower().strip()
 
-    # словарь фильтров (твой полный vf_map сюда вставлен)
+    # 3) словарь фильтров
     vf_map: Dict[str, str] = {
         "b&w": "hue=s=0",
         "warm": _chain(
@@ -287,15 +288,16 @@ async def _process_video_task(job_id: str, payload: Dict) -> Dict:
             f"gradfun=strength={0.50+0.80*k:.3f}",
         ),
     }
-
     vf = vf_map.get(pkey, vf_map["cinematic"])
 
-    # проверки фильтров (gblur/vignette)
-    supp = {name: _ffmpeg_has_filter(name) for name in ["gblur", "boxblur", "vignette"]}  # type: ignore[name-defined]
+    # 4) проверка поддержки фильтров
+    supp = {name: _ffmpeg_has_filter(name) for name in ["gblur", "boxblur", "vignette"]}
+
     gblur_fallback_used = False
     vignette_paramless_used = False
     vignette_removed = False
 
+    # gblur → boxblur (или удалить)
     if "gblur" in vf and not supp.get("gblur"):
         if supp.get("boxblur"):
             vf = re.sub(
@@ -308,15 +310,17 @@ async def _process_video_task(job_id: str, payload: Dict) -> Dict:
             vf = re.sub(r"(,)?gblur\s*=\s*[^,]+(,)?", lambda m: "," if m.group(1) and m.group(2) else "", vf).strip(",")
             gblur_fallback_used = True
 
+    # vignette → без параметров, либо удалить
     if "vignette" in vf:
         if supp.get("vignette"):
-            vf = re.sub(r"vignette\s*=\s*[^,]+", "vignette", vf)
+            # Проверим: поддерживает ли ffmpeg параметр vignette без аргументов
             vignette_paramless_used = True
+            # Если фильтр не проходит, можно попробовать убрать его
+            # (но оставим в цепочке как есть, если поддержка есть)
         else:
-            vf = re.sub(r"(,)?vignette(\s*=\s*[^,]+)?(,)?", lambda m: "," if m.group(1) and m.group(3) else "", vf).strip(",")
+            # fallback — убираем vignette
+            vf = vf.replace(",vignette", "")
             vignette_removed = True
-
-    vf = _chain(vf, "format=yuv420p")
 
     # --- stage: encoding ---
     update_job_status(job_id, RUNNING, result={"stage": "encoding", "progress": 70, "vf": vf})
@@ -1419,6 +1423,153 @@ async def flow_filter_and_publish(
         "job_id": job_id,
         "filtered_local": out_url_local,
         "cloudinary": {"secure_url": secure_url, "public_id": cld_resp.get("public_id")},
+        "publish": publish_resp,
+    }
+
+# === FLOW: filter → cover → Cloudinary → publish =======================
+
+async def _cloudinary_unsigned_upload_bytes(
+    data: bytes,
+    *,
+    filename: str,
+    resource_type: str = "image",
+    folder: Optional[str] = None,
+    public_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    if not CLOUDINARY_CLOUD or not CLOUDINARY_UNSIGNED_PRESET:
+        raise HTTPException(400, "Cloudinary not configured: set CLOUDINARY_CLOUD and CLOUDINARY_UNSIGNED_PRESET")
+    endpoint = f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD}/{resource_type}/upload"
+    form = {"upload_preset": CLOUDINARY_UNSIGNED_PRESET}
+    if folder: form["folder"] = folder
+    if public_id: form["public_id"] = public_id
+    files = {"file": (filename, data, "image/jpeg" if resource_type == "image" else "application/octet-stream")}
+    async with httpx.AsyncClient(timeout=300) as client:
+        r = await client.post(endpoint, data=form, files=files)
+        r.raise_for_status()
+        return r.json()
+
+@app.post("/flow/filter-publish-with-cover")
+async def flow_filter_publish_with_cover(
+    url: str = Body(..., embed=True),
+    preset: str = Body("cinematic", embed=True),
+    intensity: float = Body(0.7, embed=True),
+    caption: Optional[str] = Body(None, embed=True),
+    share_to_feed: bool = Body(True, embed=True),
+    # cover options
+    at: float = Body(1.0, embed=True, description="секунда кадра для обложки"),
+    title: Optional[str] = Body(None, embed=True),
+    title_pos: str = Body("bottom", embed=True),   # bottom|top
+    title_font: Optional[str] = Body(None, embed=True),  # напр. "Inter" (если установлен)
+    title_padding: int = Body(32, embed=True),
+    cloudinary_folder: Optional[str] = Body(None, embed=True),
+    timeout_sec: int = Body(600, embed=True),
+    poll_interval_sec: float = Body(1.5, embed=True),
+):
+    # 1) фильтруем видео (используем ваш enqueue+ожидание из flow_filter-and-publish)
+    payload = {"url": url, "preset": preset, "intensity": float(intensity)}
+    try:
+        job_obj_or_id = create_job(kind="video_filter", payload=payload)
+    except TypeError:
+        job_obj_or_id = create_job(payload=payload)
+    job_id = getattr(job_obj_or_id, "id", job_obj_or_id)
+    if not isinstance(job_id, str):
+        job_id = str(job_id)
+    await job_queue.put(job_id)
+
+    deadline = time.time() + max(10, timeout_sec)
+    result = None
+    while time.time() < deadline:
+        j = get_job(job_id)
+        if j and (j.get("status") or "").upper() == "DONE":
+            result = j.get("result") or {}
+            break
+        if j and (j.get("status") or "").upper() == "ERROR":
+            return {"ok": False, "stage": "filter", "job_id": job_id, "error": j.get("error")}
+        await asyncio.sleep(poll_interval_sec)
+    if not result or not result.get("output_url"):
+        return {"ok": False, "stage": "filter", "job_id": job_id, "error": "timeout or no output_url"}
+
+    local_video_path = OUT_DIR / Path(result["output_url"]).name
+    if not local_video_path.exists():
+        return {"ok": False, "stage": "local_video", "error": f"not found: {local_video_path}"}
+
+    # 2) вытаскиваем кадр (используем ваш /media/reel-cover код напрямую)
+    if not _has_ffmpeg():
+        return {"ok": False, "stage": "ffmpeg", "error": "ffmpeg not available"}
+    frame = OUT_DIR / _uuid_name("cover_frame", ".jpg")
+    p = subprocess.run(
+        [FFMPEG, "-y", "-ss", str(max(0.0, at)), "-i", str(local_video_path), "-frames:v", "1", "-q:v", "2", str(frame)],
+        capture_output=True, text=True
+    )
+    if p.returncode != 0:
+        return {"ok": False, "stage": "cover_frame", "stderr": p.stderr[-800:]}
+
+    # 3) рисуем заголовок (если задан) — используем ваш PIL стек
+    cover_path = frame
+    if title and PIL_OK:
+        try:
+            img = Image.open(frame).convert("RGBA")
+            draw = ImageDraw.Draw(img)
+            font = _pick_font(size=64, name=title_font)
+            wrapped = textwrap.fill(title, width=20)
+            if hasattr(draw, "multiline_textbbox"):
+                bbox = draw.multiline_textbbox((0, 0), wrapped, font=font, spacing=4, align="left")
+                tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
+            else:
+                try:
+                    bbox = draw.textbbox((0, 0), wrapped, font=font)
+                    tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
+                except Exception:
+                    tw, th = draw.textsize(wrapped, font=font)
+            pad = max(8, int(title_padding))
+            if title_pos == "top":
+                xy = (pad, pad)
+            else:
+                xy = (pad, img.height - th - pad)
+            bg = Image.new("RGBA", (tw + pad*2, th + pad*2), (0, 0, 0, 160))
+            img.paste(bg, (xy[0]-pad, xy[1]-pad), bg)
+            draw.multiline_text(xy, wrapped, font=font, fill=(255,255,255,255), spacing=4)
+            cover_rgba = OUT_DIR / _uuid_name("cover", ".png")
+            img.save(cover_rgba)
+            # JPEG для Cloudinary (экономия)
+            cover_jpg = OUT_DIR / _uuid_name("cover", ".jpg")
+            _save_image_rgb(Image.open(cover_rgba), cover_jpg, quality=92)
+            cover_path = cover_jpg
+        except Exception as e:
+            # fallback — шлём исходный кадр
+            cover_path = frame
+
+    # 4) Cloudinary: грузим видео + обложку
+    cld_video = await _cloudinary_unsigned_upload_file(
+        local_video_path, resource_type="video", folder=cloudinary_folder
+    )
+    cld_cover = await _cloudinary_unsigned_upload_file(
+        cover_path, resource_type="image", folder=cloudinary_folder
+    )
+    video_secure_url = cld_video.get("secure_url")
+    cover_secure_url = cld_cover.get("secure_url")
+    if not video_secure_url or not cover_secure_url:
+        return {"ok": False, "stage": "cloudinary", "error": "upload failed", "video_ok": bool(video_secure_url), "cover_ok": bool(cover_secure_url)}
+
+    # 5) Публикуем в IG с cover_url
+    publish_resp = await ig_publish_video(
+        video_url=video_secure_url,
+        caption=caption,
+        cover_url=cover_secure_url,
+        share_to_feed=share_to_feed,
+    )
+
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "filtered_local": str(local_video_path),
+        "cover_local": str(cover_path),
+        "cloudinary": {
+            "video_public_id": cld_video.get("public_id"),
+            "video_url": video_secure_url,
+            "cover_public_id": cld_cover.get("public_id"),
+            "cover_url": cover_secure_url,
+        },
         "publish": publish_resp,
     }
 
