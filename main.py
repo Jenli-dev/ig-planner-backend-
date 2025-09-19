@@ -474,7 +474,7 @@ async def _download_to(url: str, dst_path: Path) -> Path:
         "User-Agent": "ig-planner/1.0 (+https://ig-planner-backend.onrender.com)",
         "Accept": "*/*",
     }
-    async with÷ (timeout=120, headers=headers, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=120, headers=headers, follow_redirects=True) as client:
         r = await client.get(url)
         try:
             r.raise_for_status()
