@@ -1,5 +1,5 @@
 import os, secrets, json, time, asyncio, uuid, subprocess, textwrap, shutil
-from jobs import create_job, set_job_status, get_job, JobStatus
+from jobs import create_job, get_job, update_job_status, PENDING, RUNNING, DONE, ERROR
 from typing import Optional, List, Dict, Any
 from urllib.parse import urlencode
 from pathlib import Path
@@ -160,32 +160,63 @@ for d in [STATIC_DIR, UPLOAD_DIR, OUT_DIR]:
 app = FastAPI()
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
+# --- worker loop + video processor (совместимо с новым jobs.py) ---
+
+from typing import Dict
+import asyncio
+from jobs import get_job, update_job_status, RUNNING, DONE, ERROR
+
 # === background jobs ===
 VIDEO_WORKERS = int(os.getenv("VIDEO_WORKERS", "1"))
 job_queue: asyncio.Queue[str] = asyncio.Queue()
 app.state.worker_tasks: list[asyncio.Task] = []
+async def _worker_loop():
+    while True:
+        job_id = await job_queue.get()
+        try:
+            job = get_job(job_id)
+            if not job:
+                continue
 
-async def _process_video_task(payload: dict) -> dict:
+            update_job_status(job_id, RUNNING)
+            # передаём job_id и payload
+            result = await _process_video_task(job_id, job["payload"])
+
+            # если обработчик сам не проставил DONE — делаем здесь
+            j = get_job(job_id)
+            if j and j["status"] not in (DONE, ERROR):
+                update_job_status(job_id, DONE, result=result)
+        except Exception as e:
+            update_job_status(job_id, ERROR, error=str(e))
+        finally:
+            job_queue.task_done()
+async def _process_video_task(job_id: str, payload: Dict) -> Dict:
     """
-    Работник очереди: берёт payload = {url, preset, intensity},
-    скачивает видео и применяет фильтры через ffmpeg.
-    Возвращает dict как раньше в /media/filter/video.
+    Обработчик задачи: скачивает видео, применяет фильтры через ffmpeg,
+    обновляет промежуточные статусы (downloading, preparing, encoding),
+    и возвращает dict с результатом.
     """
     import re
     import subprocess
+
+    # --- stage: downloading ---
+    update_job_status(job_id, RUNNING, result={"stage": "downloading", "progress": 10})
 
     url = payload["url"]
     preset = payload.get("preset", "cinematic")
     intensity = float(payload.get("intensity", 0.7))
 
-    if not _has_ffmpeg():
+    if not _has_ffmpeg():  # type: ignore[name-defined]
         raise RuntimeError("ffmpeg not available")
 
-    # 1) скачать исходник
-    src = UPLOAD_DIR / _uuid_name("flt_vid", _ext_from_url(url, ".mp4"))
-    await _download_to(url, src)
+    # скачиваем исходник
+    src = UPLOAD_DIR / _uuid_name("flt_vid", _ext_from_url(url, ".mp4"))  # type: ignore[name-defined]
+    await _download_to(url, src)  # type: ignore[name-defined]
 
-    # 2) нормализуем интенсивность
+    # --- stage: preparing filters ---
+    update_job_status(job_id, RUNNING, result={"stage": "preparing_filters", "progress": 30})
+
+    # нормализуем интенсивность
     k = max(0.0, min(1.0, intensity))
 
     # хелпер для сборки vf-цепочки
@@ -194,7 +225,7 @@ async def _process_video_task(payload: dict) -> dict:
 
     pkey = (preset or "cinematic").lower().strip()
 
-    # 3) словарь фильтров
+    # словарь фильтров (твой полный vf_map сюда вставлен)
     vf_map: Dict[str, str] = {
         "b&w": "hue=s=0",
         "warm": _chain(
@@ -259,26 +290,26 @@ async def _process_video_task(payload: dict) -> dict:
 
     vf = vf_map.get(pkey, vf_map["cinematic"])
 
-    # 4) проверка поддержки фильтров
-    supp = {name: _ffmpeg_has_filter(name) for name in ["gblur", "boxblur", "vignette"]}
-
+    # проверки фильтров (gblur/vignette)
+    supp = {name: _ffmpeg_has_filter(name) for name in ["gblur", "boxblur", "vignette"]}  # type: ignore[name-defined]
     gblur_fallback_used = False
     vignette_paramless_used = False
     vignette_removed = False
 
-    # gblur → boxblur
     if "gblur" in vf and not supp.get("gblur"):
         if supp.get("boxblur"):
-            vf = re.sub(r"gblur\s*=\s*sigma\s*=\s*([\d.]+)", lambda m: f"boxblur={round(2*float(m.group(1))+0.5,2)}:1", vf)
+            vf = re.sub(
+                r"gblur\s*=\s*sigma\s*=\s*([\d.]+)",
+                lambda m: f"boxblur={round(2*float(m.group(1))+0.5, 2)}:1",
+                vf
+            )
             gblur_fallback_used = True
         else:
             vf = re.sub(r"(,)?gblur\s*=\s*[^,]+(,)?", lambda m: "," if m.group(1) and m.group(2) else "", vf).strip(",")
             gblur_fallback_used = True
 
-    # vignette → paramless или удалить
     if "vignette" in vf:
         if supp.get("vignette"):
-            # оставляем как есть, но без параметров
             vf = re.sub(r"vignette\s*=\s*[^,]+", "vignette", vf)
             vignette_paramless_used = True
         else:
@@ -287,22 +318,77 @@ async def _process_video_task(payload: dict) -> dict:
 
     vf = _chain(vf, "format=yuv420p")
 
-    # 5) запуск ffmpeg
-    out_path = OUT_DIR / _uuid_name("flt_vid_out", ".mp4")
+    # --- stage: encoding ---
+    update_job_status(job_id, RUNNING, result={"stage": "encoding", "progress": 70, "vf": vf})
+
+    # 5) запуск ffmpeg с прогрессом
+    # Получим длительность исходника, чтобы нормировать прогресс
+    total_dur = None
+    try:
+        meta = _ffprobe_json(src)  # type: ignore[name-defined]
+        fmt = meta.get("format", {})
+        total_dur = float(fmt.get("duration") or 0) or None
+    except Exception:
+        total_dur = None  # не критично
+
+    out_path = OUT_DIR / _uuid_name("flt_vid_out", ".mp4")  # type: ignore[name-defined]
     cmd = [
-        FFMPEG, "-y", "-i", str(src),
+        FFMPEG, "-y", "-i", str(src),                      # type: ignore[name-defined]
         "-vf", vf,
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart",
         str(out_path),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
 
-    if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed: {proc.stderr[-500:]}")
+    # Асинхронный запуск ffmpeg и чтение stderr для прогресса
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
 
-    return {
+    last_pct = 70  # мы уже показали "encoding" 70% перед запуском
+    last_t = 0.0
+    time_re = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
+
+    while True:
+        if proc.stderr is None:
+            break
+        line = await proc.stderr.readline()
+        if not line:
+            break
+        s = line.decode("utf-8", errors="ignore").strip()
+
+        m = time_re.search(s)
+        if m:
+            h, mi, sec = int(m.group(1)), int(m.group(2)), float(m.group(3))
+            cur_sec = h * 3600 + mi * 60 + sec
+            if total_dur and total_dur > 0:
+                frac = min(1.0, max(0.0, cur_sec / total_dur))
+                pct = 70 + int(frac * 29)  # 70..99
+            else:
+                pct = min(99, last_pct + 1)
+
+            now = time.time()
+            if pct != last_pct and (now - last_t) >= 0.3:
+                update_job_status(job_id, RUNNING, result={"stage": "encoding", "progress": pct, "vf": vf})
+                last_pct = pct
+                last_t = now
+
+    rc = await proc.wait()
+    if rc != 0:
+        err_tail = ""
+        try:
+            if proc.stderr is not None:
+                rem = await proc.stderr.read()
+                err_tail = (rem or b"").decode("utf-8", errors="ignore")[-500:]
+        except Exception:
+            pass
+        update_job_status(job_id, ERROR, error=(err_tail or "ffmpeg failed")[-500:])
+        raise RuntimeError(f"ffmpeg failed: {err_tail}")
+
+    result = {
         "ok": True,
         "preset": pkey,
         "intensity": k,
@@ -310,22 +396,34 @@ async def _process_video_task(payload: dict) -> dict:
         "gblur_fallback": gblur_fallback_used,
         "vignette_paramless": vignette_paramless_used,
         "vignette_removed": vignette_removed,
-        "output_url": _public_url(out_path),
+        "output_url": _public_url(out_path),  # type: ignore[name-defined]
     }
+
+    # --- stage: done ---
+    update_job_status(job_id, DONE, result=result)
+    return result
+
+# сверху:
+# from jobs import get_job, update_job_status, PENDING, RUNNING, DONE, ERROR
 
 async def _worker_loop():
     while True:
         job_id = await job_queue.get()
-        job = get_job(job_id)
-        if not job:
-            job_queue.task_done()
-            continue
-        set_job_status(job_id, JobStatus.RUNNING)
         try:
-            result = await _process_video_task(job["payload"])
-            set_job_status(job_id, JobStatus.DONE, result=result)
+            job = get_job(job_id)
+            if not job:
+                continue
+
+            update_job_status(job_id, RUNNING)
+            # передаём и job_id, и payload — удобно для логики сохранения результата
+            result = await _process_video_task(job_id, job["payload"])
+
+            # если процессор сам не проставил DONE — делаем это здесь
+            j = get_job(job_id)
+            if j and j["status"] not in (DONE, ERROR):
+                update_job_status(job_id, DONE, result=result)
         except Exception as e:
-            set_job_status(job_id, JobStatus.ERROR, error=str(e))
+            update_job_status(job_id, ERROR, error=str(e))
         finally:
             job_queue.task_done()
 
@@ -663,6 +761,14 @@ async def oauth_callback(code: Optional[str] = None, state: Optional[str] = None
             "long_lived": {"access_token": user_token, "token_type": long_user.get("token_type"), "expires_in": long_user.get("expires_in")},
             "note": "Сохраните IG_ACCESS_TOKEN в переменных окружения сервера.",
         }
+# рядом с /oauth/callback
+@app.get("/auth/callback")
+async def auth_callback(
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None
+):
+    return await oauth_callback(code=code, state=state, error=error)
 
 # ── Who am I (IG) ───────────────────────────────────────────────────────
 @app.get("/me/instagram")
@@ -1113,6 +1219,146 @@ async def ig_comment_after_publish(
         except httpx.HTTPStatusError as e:
             return {"ok": False, "stage": "comment", "error": e.response.json()}
         return {"ok": True, "result": r.json()}
+
+# === FLOW: filter → (upload to Cloudinary) → publish to IG =============
+
+async def _cloudinary_unsigned_upload_file(
+    path: Path,
+    *,
+    resource_type: str = "video",
+    folder: Optional[str] = None,
+    public_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Загрузка локального файла в Cloudinary (unsigned).
+    Требуются ENV: CLOUDINARY_CLOUD и CLOUDINARY_UNSIGNED_PRESET.
+    """
+    if not CLOUDINARY_CLOUD or not CLOUDINARY_UNSIGNED_PRESET:
+        raise HTTPException(400, "Cloudinary not configured: set CLOUDINARY_CLOUD and CLOUDINARY_UNSIGNED_PRESET")
+
+    endpoint = f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD}/{resource_type}/upload"
+    data = {"upload_preset": CLOUDINARY_UNSIGNED_PRESET}
+    if folder:
+        data["folder"] = folder
+    if public_id:
+        data["public_id"] = public_id
+
+    # определим mime
+    mime = "video/mp4" if resource_type == "video" else "image/jpeg"
+    files = {"file": (path.name, path.read_bytes(), mime)}
+
+    async with httpx.AsyncClient(timeout=300) as client:
+        r = await client.post(endpoint, data=data, files=files)
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            try:
+                err = e.response.json()
+            except Exception:
+                err = {"status": e.response.status_code, "text": e.response.text[:500]}
+            raise HTTPException(502, f"Cloudinary upload failed: {err}")
+        return r.json()
+
+
+@app.post("/flow/filter-and-publish")
+async def flow_filter_and_publish(
+    url: str = Body(..., embed=True),
+    preset: str = Body("cinematic", embed=True),
+    intensity: float = Body(0.7, embed=True),
+    caption: Optional[str] = Body(None, embed=True),
+    share_to_feed: bool = Body(True, embed=True),
+    cover_url: Optional[str] = Body(None, embed=True),
+    timeout_sec: int = Body(600, embed=True),
+    poll_interval_sec: float = Body(1.5, embed=True),
+    cloudinary_folder: Optional[str] = Body(None, embed=True),
+):
+    """
+    Сценарий: фильтруем видео → заливаем в Cloudinary (unsigned) → публикуем в IG.
+    Требуются ENV: IG_ACCESS_TOKEN (+ страница с IG бизнес-аккаунтом) и CLOUDINARY_*.
+    """
+    # 1) enqueue
+    payload = {"url": url, "preset": preset, "intensity": float(intensity)}
+    try:
+        job_obj_or_id = create_job(kind="video_filter", payload=payload)
+    except TypeError:
+        job_obj_or_id = create_job(payload=payload)
+    job_id = getattr(job_obj_or_id, "id", job_obj_or_id)
+    if not isinstance(job_id, str):
+        job_id = str(job_id)
+    await job_queue.put(job_id)
+
+    # 2) wait for DONE (or ERROR/timeout)
+    deadline = time.time() + max(10, timeout_sec)
+    last_status = None
+    while time.time() < deadline:
+        j = get_job(job_id)
+        if not j:
+            await asyncio.sleep(poll_interval_sec)
+            continue
+        st = (j.get("status") or "").upper()
+        last_status = {"status": st, "result": j.get("result"), "error": j.get("error")}
+        if st == "DONE":
+            break
+        if st == "ERROR":
+            return {
+                "ok": False,
+                "stage": "filter",
+                "job_id": job_id,
+                "error": j.get("error") or "unknown error",
+                "last_status": last_status,
+            }
+        await asyncio.sleep(poll_interval_sec)
+
+    if not last_status or last_status.get("status") != "DONE":
+        return {"ok": False, "stage": "filter", "job_id": job_id, "error": "timeout waiting filter result"}
+
+    result = (get_job(job_id) or {}).get("result") or {}
+    out_url_local = result.get("output_url")
+    if not out_url_local:
+        return {"ok": False, "stage": "filter", "job_id": job_id, "error": "no output_url from filter"}
+
+    # 3) upload to Cloudinary (unsigned)
+    #    Полезно складывать в папку проекта (не обязательно)
+    try:
+        # локальный абсолютный путь к файлу
+        local_path = OUT_DIR / Path(out_url_local).name
+        if not local_path.exists():
+            # fallback: если вдруг output_url с путём типа /static/out/..., вытащим basename
+            local_path = next((OUT_DIR / Path(out_url_local).name).glob("*"), OUT_DIR / Path(out_url_local).name)
+        cld_resp = await _cloudinary_unsigned_upload_file(
+            local_path,
+            resource_type="video",
+            folder=cloudinary_folder,
+        )
+        secure_url = cld_resp.get("secure_url")
+        if not secure_url:
+            return {"ok": False, "stage": "cloudinary", "error": "no secure_url in Cloudinary response"}
+    except HTTPException as he:
+        # Пробрасываем как есть
+        raise he
+    except Exception as e:
+        return {"ok": False, "stage": "cloudinary", "error": str(e)}
+
+    # 4) publish to IG (используем наш уже существующий обработчик)
+    try:
+        publish_resp = await ig_publish_video(
+            video_url=secure_url,
+            caption=caption,
+            cover_url=cover_url,
+            share_to_feed=share_to_feed,
+        )
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        return {"ok": False, "stage": "publish", "error": str(e)}
+
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "filtered_local": out_url_local,
+        "cloudinary": {"secure_url": secure_url, "public_id": cld_resp.get("public_id")},
+        "publish": publish_resp,
+    }
 
 # ======================================================================
 #                           MEDIA TOOLBOX
@@ -1681,7 +1927,7 @@ async def media_filter_image(
         return {"ok": False, "stage": "filter", "error": str(e)}
 
 
-# NEW: ставим задачу на фоновую обработку видео
+# NEW: ставим задачу на фоновую обработку видео (очередь + статус)
 @app.post("/media/filter/video")
 async def enqueue_filter_video(body: dict = Body(...)):
     """
@@ -1699,7 +1945,24 @@ async def enqueue_filter_video(body: dict = Body(...)):
         raise HTTPException(status_code=400, detail="Field 'preset' is required")
 
     payload = {"url": url, "preset": preset, "intensity": float(intensity)}
-    job_id = create_job(kind="video_filter", payload=payload)
+
+    # Совместимость с разными версиями jobs.py
+    try:
+        # Вариант 1: create_job(kind=..., payload=...) -> str id
+        job_obj_or_id = create_job(kind="video_filter", payload=payload)
+    except TypeError:
+        try:
+            # Вариант 2: create_job(payload=..., preset=...) -> Job or id
+            job_obj_or_id = create_job(payload=payload, preset="video_filter")
+        except TypeError:
+            # Вариант 3: create_job(payload=...) -> Job or id
+            job_obj_or_id = create_job(payload=payload)
+
+    # извлекаем строковый id
+    job_id = getattr(job_obj_or_id, "id", job_obj_or_id)
+    if not isinstance(job_id, str):
+        job_id = str(job_id)
+
     await job_queue.put(job_id)
 
     return {
@@ -1711,28 +1974,22 @@ async def enqueue_filter_video(body: dict = Body(...)):
 
 @app.get("/media/filter/status")
 async def media_filter_status(job_id: str):
-    """
-    Возвращает статус и (при успехе) результат обработки.
-    """
     job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
+    status_val = job.get("status")
     data = {
         "ok": True,
         "job_id": job_id,
         "kind": job.get("kind"),
-        "status": job.get("status"),
+        "status": status_val,
         "created_at": job.get("created_at"),
-        "started_at": job.get("started_at"),
-        "finished_at": job.get("finished_at"),
+        "updated_at": job.get("updated_at"),
+        "result": job.get("result"),
+        "error": job.get("error"),
     }
-    if job.get("status") == JobStatus.DONE:
-        data["result"] = job.get("result")
-    if job.get("status") == JobStatus.ERROR:
-        data["error"] = job.get("error")
     return data
-
             
 # 7) COMPOSITE COVER
 @app.post("/media/composite/cover")

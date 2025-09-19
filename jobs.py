@@ -1,46 +1,43 @@
 # jobs.py
-from enum import Enum
-from dataclasses import dataclass
-from typing import Optional, Dict
-from uuid import uuid4
-from threading import Lock
+from typing import Dict, Any, Optional
+import uuid
+import time
 
-class JobStatus(str, Enum):
-    queued = "queued"
-    running = "running"
-    done = "done"
-    error = "error"
+PENDING = "PENDING"
+RUNNING = "RUNNING"
+DONE = "DONE"
+ERROR = "ERROR"
 
-@dataclass
-class Job:
-    id: str
-    status: JobStatus = JobStatus.queued
-    message: Optional[str] = None
-    output_url: Optional[str] = None
-    preset: Optional[str] = None
-    intensity: Optional[float] = None
+_store: Dict[str, Dict[str, Any]] = {}
 
-_jobs: Dict[str, Job] = {}
-_lock = Lock()
+def create_job(kind: str, payload: Dict[str, Any]) -> str:
+    job_id = str(uuid.uuid4())
+    _store[job_id] = {
+        "id": job_id,
+        "kind": kind,
+        "payload": payload,
+        "status": PENDING,
+        "result": None,
+        "error": None,
+        "created_at": time.time(),
+        "updated_at": time.time(),
+    }
+    return job_id
 
-def create_job(preset: str, intensity: float) -> Job:
-    job = Job(id=uuid4().hex, preset=preset, intensity=intensity)
-    with _lock:
-        _jobs[job.id] = job
-    return job
+def get_job(job_id: str) -> Optional[Dict[str, Any]]:
+    return _store.get(job_id)
 
-def set_job_status(job_id: str, status: JobStatus, *, message: Optional[str]=None,
-                   output_url: Optional[str]=None):
-    with _lock:
-        job = _jobs.get(job_id)
-        if not job:
-            return
-        job.status = status
-        if message is not None:
-            job.message = message
-        if output_url is not None:
-            job.output_url = output_url
-
-def get_job(job_id: str) -> Optional[Job]:
-    with _lock:
-        return _jobs.get(job_id)
+def update_job_status(
+    job_id: str,
+    status: str,
+    *,
+    result: Any = None,
+    error: Optional[str] = None,
+) -> None:
+    job = _store.get(job_id)
+    if not job:
+        return
+    job["status"] = status
+    job["result"] = result
+    job["error"] = error
+    job["updated_at"] = time.time()
