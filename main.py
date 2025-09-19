@@ -1684,7 +1684,7 @@ async def media_watermark(
 
 # 6) FILTERS (image/video)
 @app.post("/media/filter/image")
-async def media_filter_image(
+async def media_filter_image_v2(
     url: str = Body(..., embed=True),
     preset: str = Body("cinematic", embed=True),
     intensity: float = Body(0.7, embed=True),
