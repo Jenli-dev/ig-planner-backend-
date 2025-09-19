@@ -770,6 +770,68 @@ async def auth_callback(
 ):
     return await oauth_callback(code=code, state=state, error=error)
 
+# ── Token tools: refresh & info ────────────────────────────────────────
+@app.get("/auth/token-info")
+async def auth_token_info():
+    """
+    Диагностика токена: /debug_token. Помогает понять срок действия и скоупы.
+    """
+    if not IG_LONG_TOKEN:
+        raise HTTPException(400, "IG_ACCESS_TOKEN is not set in env.")
+    if not APP_ID or not APP_SECRET:
+        raise HTTPException(500, "META_APP_ID / META_APP_SECRET are not set.")
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(
+            f"{GRAPH_BASE}/debug_token",
+            params={"input_token": IG_LONG_TOKEN, "access_token": f"{APP_ID}|{APP_SECRET}"}
+        )
+        r.raise_for_status()
+        return {"ok": True, "data": r.json().get("data", {})}
+
+
+@app.post("/auth/refresh-token")
+async def auth_refresh_token(current_token: Optional[str] = Body(None, embed=True)):
+    """
+    Обновляет long-lived user token ещё на ~60 дней.
+    Если current_token не передан — берём IG_ACCESS_TOKEN из ENV.
+    Возвращает НОВЫЙ токен — его нужно руками сохранить в Render env.
+    """
+    token_to_refresh = (current_token or IG_LONG_TOKEN or "").strip()
+    if not token_to_refresh:
+        raise HTTPException(400, "No token to refresh. Provide current_token or set IG_ACCESS_TOKEN in env.")
+    if not APP_ID or not APP_SECRET:
+        raise HTTPException(500, "META_APP_ID / META_APP_SECRET are not set.")
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(
+            TOKEN_URL,
+            params={
+                "grant_type": "fb_exchange_token",
+                "client_id": APP_ID,
+                "client_secret": APP_SECRET,
+                "fb_exchange_token": token_to_refresh,
+            },
+        )
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            # отдадим подробности от Graph
+            try:
+                err = e.response.json()
+            except Exception:
+                err = {"status": e.response.status_code, "text": e.response.text[:500]}
+            raise HTTPException(502, detail={"stage": "refresh", "error": err})
+
+        payload = r.json() or {}
+        new_token = payload.get("access_token")
+        return {
+            "ok": True,
+            "new_access_token": new_token,
+            "token_type": payload.get("token_type"),
+            "expires_in": payload.get("expires_in"),
+            "note": "Сохрани new_access_token в Render → Environment как IG_ACCESS_TOKEN и перезапусти сервис.",
+        }
+
 # ── Who am I (IG) ───────────────────────────────────────────────────────
 @app.get("/me/instagram")
 async def me_instagram():
