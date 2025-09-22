@@ -1,12 +1,22 @@
-import os, secrets, json, time, asyncio, uuid, re, subprocess, textwrap, shutil
-from jobs import create_job, get_job, update_job_status, PENDING, RUNNING, DONE, ERROR
+import os
+import secrets
+import json
+import time
+import asyncio
+import uuid
+import re
+import subprocess
+import textwrap
+import shutil
+from jobs import create_job, get_job, update_job_status, RUNNING, DONE, ERROR
 from typing import Optional, List, Dict, Any
 from urllib.parse import urlencode
 from pathlib import Path
+import random
 
 import httpx
 from fastapi import FastAPI, HTTPException, Body, Query
-from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
 from datetime import datetime, timezone
@@ -14,6 +24,7 @@ from datetime import datetime, timezone
 # OPTIONAL: Pillow (без жёсткой зависимости)
 try:
     from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
+
     PIL_OK = True
 except Exception:
     PIL_OK = False
@@ -32,27 +43,28 @@ else:
 load_dotenv()  # локально читает .env; на Render переменные берутся из Settings
 
 # Meta / OAuth
-APP_ID        = os.getenv("META_APP_ID", "").strip()
-APP_SECRET    = os.getenv("META_APP_SECRET", "").strip()
-REDIRECT_URI  = os.getenv("META_REDIRECT_URI", "").strip()
-META_AUTH     = "https://www.facebook.com/v21.0/dialog/oauth"
-META_GRAPH    = "https://graph.facebook.com/v21.0"
+APP_ID = os.getenv("META_APP_ID", "").strip()
+APP_SECRET = os.getenv("META_APP_SECRET", "").strip()
+REDIRECT_URI = os.getenv("META_REDIRECT_URI", "").strip()
+META_AUTH = "https://www.facebook.com/v21.0/dialog/oauth"
+META_GRAPH = "https://graph.facebook.com/v21.0"
 
 # Алиасы для совместимости со старым кодом
 GRAPH_BASE = META_GRAPH
-ME_URL     = f"{META_GRAPH}/me"
-TOKEN_URL  = f"{META_GRAPH}/oauth/access_token"
+ME_URL = f"{META_GRAPH}/me"
+TOKEN_URL = f"{META_GRAPH}/oauth/access_token"
 
 # Instagram / Cloudinary / прочее
-IG_LONG_TOKEN = os.getenv("IG_ACCESS_TOKEN", "").strip()   # длинный user/page токен
-PAGE_ID_ENV   = os.getenv("PAGE_ID", "").strip()           # можно не задавать
+IG_LONG_TOKEN = os.getenv("IG_ACCESS_TOKEN", "").strip()  # длинный user/page токен
+PAGE_ID_ENV = os.getenv("PAGE_ID", "").strip()  # можно не задавать
 
-CLOUDINARY_CLOUD            = os.getenv("CLOUDINARY_CLOUD", "").strip()
-CLOUDINARY_UNSIGNED_PRESET  = os.getenv("CLOUDINARY_UNSIGNED_PRESET", "").strip()
-JWT_SECRET                  = os.getenv("JWT_SECRET", "super_secret_key").strip()
+CLOUDINARY_CLOUD = os.getenv("CLOUDINARY_CLOUD", "").strip()
+CLOUDINARY_UNSIGNED_PRESET = os.getenv("CLOUDINARY_UNSIGNED_PRESET", "").strip()
+JWT_SECRET = os.getenv("JWT_SECRET", "super_secret_key").strip()
 
 # Для /oauth/start
 STATE_STORE = set()
+
 
 # ---- resolve ffmpeg/ffprobe binaries (Homebrew, /usr/local, PATH)
 def _pick_bin(*candidates: str) -> str:
@@ -66,23 +78,35 @@ def _pick_bin(*candidates: str) -> str:
                 return w
     return candidates[-1] if candidates else "ffmpeg"
 
+
 FFMPEG = _pick_bin(
     os.getenv("FFMPEG_BIN"),
     "ffmpeg",
     "/opt/homebrew/bin/ffmpeg",
-    "/usr/local/bin/ffmpeg"
+    "/usr/local/bin/ffmpeg",
 )
 FFPROBE = _pick_bin(
     os.getenv("FFPROBE_BIN"),
     "ffprobe",
     "/opt/homebrew/bin/ffprobe",
-    "/usr/local/bin/ffprobe"
+    "/usr/local/bin/ffprobe",
 )
+
 
 def _has_ffmpeg() -> bool:
     try:
-        subprocess.run([FFMPEG, "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        subprocess.run([FFPROBE, "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        subprocess.run(
+            [FFMPEG, "-version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        subprocess.run(
+            [FFPROBE, "-version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
         return True
     except Exception:
         return False
@@ -90,6 +114,7 @@ def _has_ffmpeg() -> bool:
 
 # ── ffmpeg: фильтры (кеш доступности) ──────────────────────────────────
 _FFMPEG_FILTERS_CACHE: Optional[set] = None
+
 
 def _ffmpeg_available_filters() -> set:
     """
@@ -102,7 +127,9 @@ def _ffmpeg_available_filters() -> set:
     try:
         p = subprocess.run(
             [FFMPEG, "-hide_banner", "-filters"],
-            capture_output=True, text=True, check=False
+            capture_output=True,
+            text=True,
+            check=False,
         )
         names = set()
         for line in (p.stdout or "").splitlines():
@@ -119,10 +146,12 @@ def _ffmpeg_available_filters() -> set:
         _FFMPEG_FILTERS_CACHE = set()
     return _FFMPEG_FILTERS_CACHE
 
+
 def _ffmpeg_has_filter(name: str) -> bool:
     """Проверяет наличие конкретного фильтра ffmpeg (с кешем)."""
     return name in _ffmpeg_available_filters()
-    
+
+
 # --- Cloudinary auto-transform for Reels (если прислали прямой Cloudinary URL)
 def _cld_inject_transform(url: str, transform: str) -> str:
     marker = "/upload/"
@@ -134,20 +163,25 @@ def _cld_inject_transform(url: str, transform: str) -> str:
         return f"{host}{marker}{transform}/{rest}"
     return url
 
+
 # Рекомендуемая трансформация для Reels
-_CLOUD_REELS_TRANSFORM = "c_fill,w_1080,h_1920,fps_30,vc_h264:baseline,br_3500k,ac_aac/so_0:20/f_mp4"
+_CLOUD_REELS_TRANSFORM = (
+    "c_fill,w_1080,h_1920,fps_30,vc_h264:baseline,br_3500k,ac_aac/so_0:20/f_mp4"
+)
 
 # Важно: публикация контента, комментарии, инсайты, страницы
-SCOPES = ",".join([
-    "pages_show_list",
-    "instagram_basic",
-    "pages_read_engagement",
-    "instagram_manage_insights",
-    "pages_manage_metadata",
-    "business_management",
-    "instagram_manage_comments",
-    "instagram_content_publish",
-])
+SCOPES = ",".join(
+    [
+        "pages_show_list",
+        "instagram_basic",
+        "pages_read_engagement",
+        "instagram_manage_insights",
+        "pages_manage_metadata",
+        "business_management",
+        "instagram_manage_comments",
+        "instagram_content_publish",
+    ]
+)
 
 # ── static dirs ────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
@@ -162,14 +196,13 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 # --- worker loop + video processor (совместимо с новым jobs.py) ---
 
-from typing import Dict
-import asyncio
-from jobs import get_job, update_job_status, RUNNING, DONE, ERROR
 
 # === background jobs ===
 VIDEO_WORKERS = int(os.getenv("VIDEO_WORKERS", "1"))
 job_queue: asyncio.Queue[str] = asyncio.Queue()
 app.state.worker_tasks: list[asyncio.Task] = []
+
+
 async def _worker_loop():
     while True:
         job_id = await job_queue.get()
@@ -191,6 +224,7 @@ async def _worker_loop():
         finally:
             job_queue.task_done()
 
+
 async def _process_video_task(job_id: str, payload: Dict) -> Dict:
     """
     Скачивает видео, собирает цепочку фильтров и прогоняет ffmpeg,
@@ -200,7 +234,6 @@ async def _process_video_task(job_id: str, payload: Dict) -> Dict:
     а также FFMPEG, UPLOAD_DIR, OUT_DIR, update_job_status.
     """
     # --- импорт локальный на всякий
-    import subprocess
 
     # 0) старт: объявим прогресс
     update_job_status(job_id, RUNNING, result={"stage": "downloading", "progress": 10})
@@ -216,7 +249,9 @@ async def _process_video_task(job_id: str, payload: Dict) -> Dict:
     # 1) скачать исходник
     src = UPLOAD_DIR / _uuid_name("flt_vid", _ext_from_url(url, ".mp4"))
     await _download_to(url, src)
-    update_job_status(job_id, RUNNING, result={"stage": "preparing_filters", "progress": 30})
+    update_job_status(
+        job_id, RUNNING, result={"stage": "preparing_filters", "progress": 30}
+    )
 
     # 2) нормализуем интенсивность
     k = max(0.0, min(1.0, intensity))
@@ -303,11 +338,15 @@ async def _process_video_task(job_id: str, payload: Dict) -> Dict:
             vf = re.sub(
                 r"gblur\s*=\s*sigma\s*=\s*([\d.]+)",
                 lambda m: f"boxblur={round(2*float(m.group(1))+0.5, 2)}:1",
-                vf
+                vf,
             )
             gblur_fallback_used = True
         else:
-            vf = re.sub(r"(,)?gblur\s*=\s*[^,]+(,)?", lambda m: "," if m.group(1) and m.group(2) else "", vf).strip(",")
+            vf = re.sub(
+                r"(,)?gblur\s*=\s*[^,]+(,)?",
+                lambda m: "," if m.group(1) and m.group(2) else "",
+                vf,
+            ).strip(",")
             gblur_fallback_used = True
 
     # vignette → без параметров, либо удалить
@@ -323,7 +362,9 @@ async def _process_video_task(job_id: str, payload: Dict) -> Dict:
             vignette_removed = True
 
     # --- stage: encoding ---
-    update_job_status(job_id, RUNNING, result={"stage": "encoding", "progress": 70, "vf": vf})
+    update_job_status(
+        job_id, RUNNING, result={"stage": "encoding", "progress": 70, "vf": vf}
+    )
 
     # 5) запуск ffmpeg с прогрессом
     # Получим длительность исходника, чтобы нормировать прогресс
@@ -337,11 +378,24 @@ async def _process_video_task(job_id: str, payload: Dict) -> Dict:
 
     out_path = OUT_DIR / _uuid_name("flt_vid_out", ".mp4")  # type: ignore[name-defined]
     cmd = [
-        FFMPEG, "-y", "-i", str(src),                      # type: ignore[name-defined]
-        "-vf", vf,
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
-        "-c:a", "aac", "-b:a", "128k",
-        "-movflags", "+faststart",
+        FFMPEG,
+        "-y",
+        "-i",
+        str(src),  # type: ignore[name-defined]
+        "-vf",
+        vf,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "21",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-movflags",
+        "+faststart",
         str(out_path),
     ]
 
@@ -376,7 +430,11 @@ async def _process_video_task(job_id: str, payload: Dict) -> Dict:
 
             now = time.time()
             if pct != last_pct and (now - last_t) >= 0.3:
-                update_job_status(job_id, RUNNING, result={"stage": "encoding", "progress": pct, "vf": vf})
+                update_job_status(
+                    job_id,
+                    RUNNING,
+                    result={"stage": "encoding", "progress": pct, "vf": vf},
+                )
                 last_pct = pct
                 last_t = now
 
@@ -407,8 +465,10 @@ async def _process_video_task(job_id: str, payload: Dict) -> Dict:
     update_job_status(job_id, DONE, result=result)
     return result
 
+
 # сверху:
 # from jobs import get_job, update_job_status, PENDING, RUNNING, DONE, ERROR
+
 
 async def _worker_loop():
     while True:
@@ -431,20 +491,24 @@ async def _worker_loop():
         finally:
             job_queue.task_done()
 
+
 @app.on_event("startup")
 async def _start_workers():
     for _ in range(VIDEO_WORKERS):
         task = asyncio.create_task(_worker_loop())
         app.state.worker_tasks.append(task)
 
+
 @app.on_event("shutdown")
 async def _stop_workers():
     for t in app.state.worker_tasks:
         t.cancel()
 
+
 # ── CORS (если надо дёргать из фронта) ─────────────────────────────────
 try:
     from fastapi.middleware.cors import CORSMiddleware
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -455,14 +519,17 @@ try:
 except Exception:
     pass
 
+
 # ── helpers ────────────────────────────────────────────────────────────
 def _public_url(local_path: Path) -> str:
     rel = local_path.relative_to(STATIC_DIR).as_posix()
     return f"/static/{rel}"
 
+
 def _ext_from_url(url: str, default=".bin") -> str:
     guess = os.path.splitext(url.split("?")[0])[1]
     return guess if guess else default
+
 
 async def _download_to(url: str, dst_path: Path) -> Path:
     """
@@ -474,42 +541,59 @@ async def _download_to(url: str, dst_path: Path) -> Path:
         "User-Agent": "ig-planner/1.0 (+https://ig-planner-backend.onrender.com)",
         "Accept": "*/*",
     }
-    async with httpx.AsyncClient(timeout=120, headers=headers, follow_redirects=True) as client:
+    async with httpx.AsyncClient(
+        timeout=120, headers=headers, follow_redirects=True
+    ) as client:
         r = await client.get(url)
         try:
             r.raise_for_status()
         except httpx.HTTPStatusError as e:
             status = e.response.status_code if e.response is not None else "?"
-            location = e.response.headers.get("Location") if e.response is not None else None
+            location = (
+                e.response.headers.get("Location") if e.response is not None else None
+            )
             hint = f"\nRedirect location: {location}" if location else ""
             raise RuntimeError(f"Download failed ({status}) {url}{hint}") from None
         dst_path.write_bytes(r.content)
     return dst_path
 
-# --- HTTP client with retries -------------------------------------------------
-import random
 
+# --- HTTP client with retries -------------------------------------------------
 DEFAULT_TIMEOUT = httpx.Timeout(connect=10, read=30, write=30, pool=30)
 
+
 class RetryClient(httpx.AsyncClient):
-    async def request(self, method, url, *args, retries: int = 3, backoff: float = 0.5, **kwargs):
+    async def request(
+        self, method, url, *args, retries: int = 3, backoff: float = 0.5, **kwargs
+    ):
         attempt = 0
         while True:
             try:
                 return await super().request(
-                    method, url, *args,
+                    method,
+                    url,
+                    *args,
                     timeout=kwargs.pop("timeout", DEFAULT_TIMEOUT),
-                    **kwargs
+                    **kwargs,
                 )
-            except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteError, httpx.RemoteProtocolError) as e:
+            except (
+                httpx.ConnectError,
+                httpx.ReadTimeout,
+                httpx.WriteError,
+                httpx.RemoteProtocolError,
+            ):
                 attempt += 1
                 if attempt > retries:
                     raise
-                await asyncio.sleep(backoff * (2 ** (attempt - 1)) + random.uniform(0, 0.2))
+                await asyncio.sleep(
+                    backoff * (2 ** (attempt - 1)) + random.uniform(0, 0.2)
+                )
+
 
 def _uuid_name(prefix: str, ext: str) -> str:
     ext = ext if ext.startswith(".") else f".{ext}"
     return f"{prefix}_{uuid.uuid4().hex}{ext}"
+
 
 def _parse_aspect(aspect: Optional[str]) -> Optional[float]:
     if not aspect:
@@ -525,12 +609,17 @@ def _parse_aspect(aspect: Optional[str]) -> Optional[float]:
     except Exception:
         return None
 
+
 def _ffprobe_json(path: Path) -> Dict[str, Any]:
     cmd = [
-        FFPROBE, "-v", "error",
-        "-show_format", "-show_streams",
-        "-of", "json",
-        str(path)
+        FFPROBE,
+        "-v",
+        "error",
+        "-show_format",
+        "-show_streams",
+        "-of",
+        "json",
+        str(path),
     ]
     p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode != 0:
@@ -540,10 +629,12 @@ def _ffprobe_json(path: Path) -> Dict[str, Any]:
     except Exception as e:
         raise RuntimeError(f"ffprobe parse error: {e}")
 
+
 def _image_open(path: Path) -> Image.Image:
     if not PIL_OK:
         raise RuntimeError("Pillow (PIL) is not installed. Run: pip install pillow")
     return Image.open(path).convert("RGBA")
+
 
 def _save_image_rgb(img: Image.Image, dst: Path, quality=90):
     if not PIL_OK:
@@ -551,17 +642,21 @@ def _save_image_rgb(img: Image.Image, dst: Path, quality=90):
     img_rgb = img.convert("RGB")
     img_rgb.save(dst, format="JPEG", quality=quality, optimize=True, progressive=True)
 
+
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
 
 def _iso_to_utc(ts: str) -> datetime:
     if ts.endswith("Z"):
         return datetime.fromisoformat(ts.replace("Z", "+00:00"))
     return datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
 
+
 def _sleep_seconds_until(dt: datetime) -> float:
     delta = (dt - _now_utc()).total_seconds()
-    return max(0.0, delta)    
+    return max(0.0, delta)
+
 
 # ---- Fonts: robust discovery & presets ---------------------------------
 # Можно указать папку со своими шрифтами через ENV (положить туда .ttf/.otf)
@@ -584,13 +679,23 @@ if CUSTOM_FONT_DIR:
 # Можно дополнять — главное, чтобы имя было частью файла (без расширения).
 _FONT_FALLBACKS = [
     # популярные свободные
-    "Inter", "DejaVuSans", "NotoSans", "Roboto", "OpenSans",
+    "Inter",
+    "DejaVuSans",
+    "NotoSans",
+    "Roboto",
+    "OpenSans",
     # системные
-    "Arial", "Helvetica", "SegoeUI", "SFNS", "SanFrancisco", "LiberationSans",
+    "Arial",
+    "Helvetica",
+    "SegoeUI",
+    "SFNS",
+    "SanFrancisco",
+    "LiberationSans",
 ]
 
 # Кеш найденных путей: {"inter:400": "/path/Inter-Regular.ttf", ...}
 _FONT_CACHE: Dict[str, str] = {}
+
 
 def _scan_fonts_once() -> Dict[str, str]:
     """
@@ -612,14 +717,17 @@ def _scan_fonts_once() -> Dict[str, str]:
                 pass
     return found
 
+
 # Индекс шрифтов (лениво заполняется при первом вызове)
 _FONT_INDEX: Optional[Dict[str, str]] = None
+
 
 def _font_index() -> Dict[str, str]:
     global _FONT_INDEX
     if _FONT_INDEX is None:
         _FONT_INDEX = _scan_fonts_once()
     return _FONT_INDEX
+
 
 def _resolve_font_path(preferred_names: List[str]) -> Optional[str]:
     """
@@ -638,6 +746,7 @@ def _resolve_font_path(preferred_names: List[str]) -> Optional[str]:
             if name in stem:
                 return path
     return None
+
 
 def _pick_font(size: int = 48, name: Optional[str] = None) -> "ImageFont.FreeTypeFont":
     """
@@ -674,6 +783,7 @@ def _pick_font(size: int = 48, name: Optional[str] = None) -> "ImageFont.FreeTyp
     # крайний случай — встроенный шрифт PIL
     return ImageFont.load_default()
 
+
 # ── LIVE state: берём всё из ENV и Graph API ────────────────────────────
 async def _resolve_page_and_ig_id(client: RetryClient) -> Dict[str, Any]:
     """
@@ -701,17 +811,21 @@ async def _resolve_page_and_ig_id(client: RetryClient) -> Dict[str, Any]:
     # 2) ig_id + username
     r2 = await client.get(
         f"{GRAPH_BASE}/{page_id}",
-        params={"fields": "instagram_business_account{id,username}", "access_token": IG_LONG_TOKEN},
+        params={
+            "fields": "instagram_business_account{id,username}",
+            "access_token": IG_LONG_TOKEN,
+        },
         retries=4,
     )
     r2.raise_for_status()
-    ig = (r2.json().get("instagram_business_account") or {})
+    ig = r2.json().get("instagram_business_account") or {}
     ig_id = ig.get("id")
     ig_username = ig.get("username")
     if not ig_id:
         raise HTTPException(400, "This Page has no instagram_business_account linked.")
 
     return {"page_id": page_id, "ig_id": ig_id, "ig_username": ig_username}
+
 
 async def _resolve_page_and_ig_id(client: RetryClient) -> Dict[str, Any]:
     # запрашиваем страницы пользователя
@@ -765,22 +879,26 @@ async def _load_state() -> Dict[str, Any]:
         resolved = await _resolve_page_and_ig_id(client)
         return {
             "ig_id": resolved["ig_id"],
-            "page_token": IG_LONG_TOKEN,   # используем как page_access_token
-            "user_token": IG_LONG_TOKEN,   # и как user_long_lived
+            "page_token": IG_LONG_TOKEN,  # используем как page_access_token
+            "user_token": IG_LONG_TOKEN,  # и как user_long_lived
             "page_id": resolved["page_id"],
             "ig_username": resolved["ig_username"],
         }
+
 
 # ── Healthcheck ──────────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {"ok": True, "ffmpeg": _has_ffmpeg(), "pillow": PIL_OK}
 
+
 # ── OAuth start ─────────────────────────────────────────────────────────
 @app.get("/oauth/start")
 def oauth_start():
     if not APP_ID or not APP_SECRET or not REDIRECT_URI:
-        raise HTTPException(500, "META_APP_ID / META_APP_SECRET / META_REDIRECT_URI are not set in env.")
+        raise HTTPException(
+            500, "META_APP_ID / META_APP_SECRET / META_REDIRECT_URI are not set in env."
+        )
     state = secrets.token_urlsafe(16)
     STATE_STORE.add(state)
     params = {
@@ -791,34 +909,42 @@ def oauth_start():
     }
     return RedirectResponse(f"{META_AUTH}?{urlencode(params)}")
 
+
 # ── OAuth callback (без записи в файл; просто отдаём токены) ────────────
 @app.get("/oauth/callback")
-async def oauth_callback(code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None):
+async def oauth_callback(
+    code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None
+):
     if error:
         raise HTTPException(400, f"OAuth error: {error}")
     if not code or not state or state not in STATE_STORE:
         raise HTTPException(400, "Invalid state or code")
     STATE_STORE.discard(state)
 
-    async with RetryClient() as client:        # 1) code -> short-lived user token
-        r = await client.get(TOKEN_URL, params={
-            "client_id": APP_ID,
-            "client_secret": APP_SECRET,
-            "redirect_uri": REDIRECT_URI,
-            "code": code,
-        },
-        retries=4,
-)
+    async with RetryClient() as client:  # 1) code -> short-lived user token
+        r = await client.get(
+            TOKEN_URL,
+            params={
+                "client_id": APP_ID,
+                "client_secret": APP_SECRET,
+                "redirect_uri": REDIRECT_URI,
+                "code": code,
+            },
+            retries=4,
+        )
         r.raise_for_status()
         short = r.json()
 
         # 2) short-lived -> long-lived user token
-        r2 = await client.get(TOKEN_URL, params={
-            "grant_type": "fb_exchange_token",
-            "client_id": APP_ID,
-            "client_secret": APP_SECRET,
-            "fb_exchange_token": short["access_token"],
-        })
+        r2 = await client.get(
+            TOKEN_URL,
+            params={
+                "grant_type": "fb_exchange_token",
+                "client_id": APP_ID,
+                "client_secret": APP_SECRET,
+                "fb_exchange_token": short["access_token"],
+            },
+        )
         r2.raise_for_status()
         long_user = r2.json()
         user_token = long_user["access_token"]
@@ -827,17 +953,22 @@ async def oauth_callback(code: Optional[str] = None, state: Optional[str] = None
         return {
             "ok": True,
             "short_lived": short,
-            "long_lived": {"access_token": user_token, "token_type": long_user.get("token_type"), "expires_in": long_user.get("expires_in")},
+            "long_lived": {
+                "access_token": user_token,
+                "token_type": long_user.get("token_type"),
+                "expires_in": long_user.get("expires_in"),
+            },
             "note": "Сохраните IG_ACCESS_TOKEN в переменных окружения сервера.",
         }
+
+
 # рядом с /oauth/callback
 @app.get("/auth/callback")
 async def auth_callback(
-    code: Optional[str] = None,
-    state: Optional[str] = None,
-    error: Optional[str] = None
+    code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None
 ):
     return await oauth_callback(code=code, state=state, error=error)
+
 
 # ── Token tools: refresh & info ────────────────────────────────────────
 @app.get("/auth/token-info")
@@ -852,7 +983,10 @@ async def auth_token_info():
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.get(
             f"{GRAPH_BASE}/debug_token",
-            params={"input_token": IG_LONG_TOKEN, "access_token": f"{APP_ID}|{APP_SECRET}"}
+            params={
+                "input_token": IG_LONG_TOKEN,
+                "access_token": f"{APP_ID}|{APP_SECRET}",
+            },
         )
         r.raise_for_status()
         return {"ok": True, "data": r.json().get("data", {})}
@@ -867,12 +1001,15 @@ async def auth_refresh_token(current_token: Optional[str] = Body(None, embed=Tru
     """
     token_to_refresh = (current_token or IG_LONG_TOKEN or "").strip()
     if not token_to_refresh:
-        raise HTTPException(400, "No token to refresh. Provide current_token or set IG_ACCESS_TOKEN in env.")
+        raise HTTPException(
+            400,
+            "No token to refresh. Provide current_token or set IG_ACCESS_TOKEN in env.",
+        )
     if not APP_ID or not APP_SECRET:
         raise HTTPException(500, "META_APP_ID / META_APP_SECRET are not set.")
 
-    async with RetryClient() as client:        
-    r = await client.get(
+    async with RetryClient() as client:
+        r = await client.get(
             TOKEN_URL,
             params={
                 "grant_type": "fb_exchange_token",
@@ -889,18 +1026,19 @@ async def auth_refresh_token(current_token: Optional[str] = Body(None, embed=Tru
             try:
                 err = e.response.json()
             except Exception:
-                err = {"status": e.response.status_code, "text": e.response.text[:500]}
-            raise HTTPException(502, detail={"stage": "refresh", "error": err})
+                err = {"error": {"message": e.response.text if e.response else str(e)}}
+            raise HTTPException(e.response.status_code if e.response else 500, err)
 
-        payload = r.json() or {}
-        new_token = payload.get("access_token")
+        data = r.json()
+        new_token = data.get("access_token")
         return {
             "ok": True,
             "new_access_token": new_token,
-            "token_type": payload.get("token_type"),
-            "expires_in": payload.get("expires_in"),
+            "token_type": data.get("token_type"),
+            "expires_in": data.get("expires_in"),
             "note": "Сохрани new_access_token в Render → Environment как IG_ACCESS_TOKEN и перезапусти сервис.",
         }
+
 
 # ── Who am I (IG) ───────────────────────────────────────────────────────
 @app.get("/me/instagram")
@@ -909,8 +1047,12 @@ async def me_instagram():
     return {
         "ok": True,
         "page_id": st["page_id"],
-        "instagram_business_account": {"id": st["ig_id"], "username": st["ig_username"]},
+        "instagram_business_account": {
+            "id": st["ig_id"],
+            "username": st["ig_username"],
+        },
     }
+
 
 # ── Pages diagnostics ───────────────────────────────────────────────────
 @app.get("/me/pages")
@@ -929,17 +1071,26 @@ async def me_pages():
             r.raise_for_status()
             pages_all = list(r.json().get("data") or [])
         except httpx.HTTPStatusError as e:
-            return {"ok": False, "status": e.response.status_code, "error": e.response.json()}
+            return {
+                "ok": False,
+                "status": e.response.status_code,
+                "error": e.response.json(),
+            }
         if not pages_all:
-            b = await client.get(f"{ME_URL}/businesses", params={"access_token": IG_LONG_TOKEN})
+            b = await client.get(
+                f"{ME_URL}/businesses", params={"access_token": IG_LONG_TOKEN}
+            )
             b.raise_for_status()
-            for biz in (b.json().get("data") or []):
+            for biz in b.json().get("data") or []:
                 bid = biz.get("id")
                 if not bid:
                     continue
                 op = await client.get(
                     f"{GRAPH_BASE}/{bid}/owned_pages",
-                    params={"access_token": IG_LONG_TOKEN, "fields": "id,name,access_token"}
+                    params={
+                        "access_token": IG_LONG_TOKEN,
+                        "fields": "id,name,access_token",
+                    },
                 )
                 op.raise_for_status()
                 pages_all.extend(op.json().get("data") or [])
@@ -948,13 +1099,18 @@ async def me_pages():
         for p in pages_all:
             pid = p.get("id")
             name = p.get("name")
-            ptok = p.get("access_token") or IG_LONG_TOKEN  # если у страницы нет собственного токена
+            ptok = (
+                p.get("access_token") or IG_LONG_TOKEN
+            )  # если у страницы нет собственного токена
             has_ig = None
             ig = None
             if pid:
                 r2 = await client.get(
                     f"{GRAPH_BASE}/{pid}",
-                    params={"fields": "instagram_business_account{id,username}", "access_token": ptok}
+                    params={
+                        "fields": "instagram_business_account{id,username}",
+                        "access_token": ptok,
+                    },
                 )
                 try:
                     r2.raise_for_status()
@@ -962,11 +1118,13 @@ async def me_pages():
                     has_ig = bool(ig and ig.get("id"))
                 except httpx.HTTPStatusError:
                     has_ig = False
-            out.append({"id": pid, "name": name, "has_instagram_business": has_ig, "ig": ig})
+            out.append(
+                {"id": pid, "name": name, "has_instagram_business": has_ig, "ig": ig}
+            )
 
     return {"ok": True, "pages": out}
-        
-        
+
+
 # ── Debug scopes ────────────────────────────────────────────────────────
 @app.get("/debug/scopes")
 async def debug_scopes():
@@ -975,11 +1133,20 @@ async def debug_scopes():
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.get(
             f"{GRAPH_BASE}/debug_token",
-            params={"input_token": IG_LONG_TOKEN, "access_token": f"{APP_ID}|{APP_SECRET}"}
+            params={
+                "input_token": IG_LONG_TOKEN,
+                "access_token": f"{APP_ID}|{APP_SECRET}",
+            },
         )
         r.raise_for_status()
         info = r.json().get("data", {})
-    return {"ok": True, "is_valid": info.get("is_valid"), "scopes": info.get("scopes", []), "type": info.get("type")}
+    return {
+        "ok": True,
+        "is_valid": info.get("is_valid"),
+        "scopes": info.get("scopes", []),
+        "type": info.get("type"),
+    }
+
 
 # ── IG: latest media ────────────────────────────────────────────────────
 @app.get("/ig/media")
@@ -990,10 +1157,18 @@ async def ig_media(limit: int = 12, after: Optional[str] = None):
     params = {
         "access_token": page_token,
         "limit": max(1, min(limit, 50)),
-        "fields": ",".join([
-            "id","caption","media_type","media_url","permalink",
-            "thumbnail_url","timestamp","product_type"
-        ])
+        "fields": ",".join(
+            [
+                "id",
+                "caption",
+                "media_type",
+                "media_url",
+                "permalink",
+                "thumbnail_url",
+                "timestamp",
+                "product_type",
+            ]
+        ),
     }
     if after:
         params["after"] = after
@@ -1002,7 +1177,13 @@ async def ig_media(limit: int = 12, after: Optional[str] = None):
         r = await client.get(f"{GRAPH_BASE}/{ig_id}/media", params=params, retries=4)
         r.raise_for_status()
         payload = r.json()
-    return {"ok": True, "count": len(payload.get("data", [])), "data": payload.get("data", []), "paging": payload.get("paging", {})}
+    return {
+        "ok": True,
+        "count": len(payload.get("data", [])),
+        "data": payload.get("data", []),
+        "paging": payload.get("paging", {}),
+    }
+
 
 # ── IG: COMMENTS (list + create/reply/moderation) ───────────────────────
 @app.get("/ig/comments")
@@ -1014,13 +1195,18 @@ async def ig_comments(media_id: str = Query(...), limit: int = 25):
             params={
                 "access_token": st["page_token"],
                 "limit": max(1, min(limit, 50)),
-                "fields": "id,text,username,timestamp"
+                "fields": "id,text,username,timestamp",
             },
             retries=4,
         )
         r.raise_for_status()
         payload = r.json()
-    return {"ok": True, "data": payload.get("data", []), "paging": payload.get("paging", {})}
+    return {
+        "ok": True,
+        "data": payload.get("data", []),
+        "paging": payload.get("paging", {}),
+    }
+
 
 @app.post("/ig/comment")
 async def ig_comment(
@@ -1036,41 +1222,59 @@ async def ig_comment(
             r = await client.post(
                 f"{GRAPH_BASE}/{reply_to_comment_id}/replies",
                 data={"access_token": st["page_token"], "message": message},
-            retries=4,
+                retries=4,
             )
         else:
             r = await client.post(
                 f"{GRAPH_BASE}/{media_id}/comments",
                 data={"access_token": st["page_token"], "message": message},
-        retries=4,
+                retries=4,
             )
         r.raise_for_status()
     return {"ok": True, "result": r.json()}
 
+
 @app.post("/ig/comments/hide")
-async def ig_comment_hide(comment_id: str = Body(..., embed=True), hide: bool = Body(default=True, embed=True)):
+async def ig_comment_hide(
+    comment_id: str = Body(..., embed=True), hide: bool = Body(default=True, embed=True)
+):
     st = await _load_state()
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.post(
             f"{GRAPH_BASE}/{comment_id}",
-            data={"hide": "true" if hide else "false", "access_token": st["page_token"]}
+            data={
+                "hide": "true" if hide else "false",
+                "access_token": st["page_token"],
+            },
         )
         try:
             r.raise_for_status()
         except httpx.HTTPStatusError as e:
-            return {"ok": False, "status": e.response.status_code, "error": e.response.json()}
+            return {
+                "ok": False,
+                "status": e.response.status_code,
+                "error": e.response.json(),
+            }
     return {"ok": True}
+
 
 @app.post("/ig/comments/delete")
 async def ig_comment_delete(comment_id: str = Body(..., embed=True)):
     st = await _load_state()
     async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.delete(f"{GRAPH_BASE}/{comment_id}", params={"access_token": st["page_token"]})
+        r = await client.delete(
+            f"{GRAPH_BASE}/{comment_id}", params={"access_token": st["page_token"]}
+        )
         try:
             r.raise_for_status()
         except httpx.HTTPStatusError as e:
-            return {"ok": False, "status": e.response.status_code, "error": e.response.json()}
+            return {
+                "ok": False,
+                "status": e.response.status_code,
+                "error": e.response.json(),
+            }
     return {"ok": True}
+
 
 @app.post("/ig/comments/reply-many")
 async def ig_comments_reply_many(
@@ -1085,14 +1289,24 @@ async def ig_comments_reply_many(
             try:
                 r = await client.post(
                     f"{GRAPH_BASE}/{cid}/replies",
-                    data={"access_token": st["page_token"], "message": message}
+                    data={"access_token": st["page_token"], "message": message},
                 )
                 r.raise_for_status()
-                results.append({"comment_id": cid, "ok": True, "id": r.json().get("id")})
+                results.append(
+                    {"comment_id": cid, "ok": True, "id": r.json().get("id")}
+                )
             except httpx.HTTPStatusError as e:
-                results.append({"comment_id": cid, "ok": False, "status": e.response.status_code, "error": e.response.json()})
+                results.append(
+                    {
+                        "comment_id": cid,
+                        "ok": False,
+                        "status": e.response.status_code,
+                        "error": e.response.json(),
+                    }
+                )
             await asyncio.sleep(max(0.0, delay_ms / 1000.0))
     return {"ok": True, "results": results}
+
 
 # ── IG: PUBLISH (image) ─────────────────────────────────────────────────
 @app.post("/ig/publish/image")
@@ -1110,11 +1324,15 @@ async def ig_publish_image(
             r1.raise_for_status()
             creation_id = r1.json().get("id")
             if not creation_id:
-                return {"ok": False, "stage": "create", "error": "No creation_id in response"}
+                return {
+                    "ok": False,
+                    "stage": "create",
+                    "error": "No creation_id in response",
+                }
 
             r2 = await client.post(
                 f"{GRAPH_BASE}/{st['ig_id']}/media_publish",
-                data={"creation_id": creation_id, "access_token": st["page_token"]}
+                data={"creation_id": creation_id, "access_token": st["page_token"]},
             )
             r2.raise_for_status()
             return {"ok": True, "creation_id": creation_id, "published": r2.json()}
@@ -1123,9 +1341,15 @@ async def ig_publish_image(
                 err_json = e.response.json()
             except Exception:
                 err_json = {"raw": e.response.text[:500]}
-            return {"ok": False, "stage": "graph", "status": e.response.status_code, "error": err_json}
+            return {
+                "ok": False,
+                "stage": "graph",
+                "status": e.response.status_code,
+                "error": err_json,
+            }
         except Exception as e:
             return {"ok": False, "stage": "client", "error": str(e)}
+
 
 # ── IG: PUBLISH (REELS video) ──────────────────────────────────────────
 @app.post("/ig/publish/video")
@@ -1154,7 +1378,12 @@ async def ig_publish_video(
         try:
             r1.raise_for_status()
         except httpx.HTTPStatusError as e:
-            return {"ok": False, "stage": "create_container", "status": e.response.status_code, "error": e.response.json()}
+            return {
+                "ok": False,
+                "stage": "create_container",
+                "status": e.response.status_code,
+                "error": e.response.json(),
+            }
         creation_id = (r1.json() or {}).get("id")
         if not creation_id:
             raise HTTPException(500, "Failed to create video container")
@@ -1169,34 +1398,63 @@ async def ig_publish_video(
         while waited < max_wait_sec:
             rstat = await client.get(
                 f"{GRAPH_BASE}/{creation_id}",
-                params={"fields": "status,status_code", "access_token": st["page_token"]}
+                params={
+                    "fields": "status,status_code",
+                    "access_token": st["page_token"],
+                },
             )
             try:
                 rstat.raise_for_status()
             except httpx.HTTPStatusError as e:
-                return {"ok": False, "stage": "check_status", "status": e.response.status_code, "creation_id": creation_id, "error": e.response.json()}
+                return {
+                    "ok": False,
+                    "stage": "check_status",
+                    "status": e.response.status_code,
+                    "creation_id": creation_id,
+                    "error": e.response.json(),
+                }
             payload_stat = rstat.json() or {}
             status_code = payload_stat.get("status_code") or "IN_PROGRESS"
             status_text = payload_stat.get("status")
             if status_code == "FINISHED":
                 break
             if status_code == "ERROR":
-                return {"ok": False, "stage": "processing", "status_code": status_code, "status": status_text, "creation_id": creation_id}
+                return {
+                    "ok": False,
+                    "stage": "processing",
+                    "status_code": status_code,
+                    "status": status_text,
+                    "creation_id": creation_id,
+                }
             await asyncio.sleep(sleep_sec)
             waited += sleep_sec
 
         if status_code != "FINISHED":
-            return {"ok": False, "stage": "timeout", "status_code": status_code, "status": status_text, "creation_id": creation_id, "waited_sec": waited}
+            return {
+                "ok": False,
+                "stage": "timeout",
+                "status_code": status_code,
+                "status": status_text,
+                "creation_id": creation_id,
+                "waited_sec": waited,
+            }
 
         r2 = await client.post(
             f"{GRAPH_BASE}/{st['ig_id']}/media_publish",
-            data={"creation_id": creation_id, "access_token": st["page_token"]}
+            data={"creation_id": creation_id, "access_token": st["page_token"]},
         )
         try:
             r2.raise_for_status()
         except httpx.HTTPStatusError as e:
-            return {"ok": False, "stage": "publish", "status": e.response.status_code, "creation_id": creation_id, "error": e.response.json()}
+            return {
+                "ok": False,
+                "stage": "publish",
+                "status": e.response.status_code,
+                "creation_id": creation_id,
+                "error": e.response.json(),
+            }
         return {"ok": True, "creation_id": creation_id, "published": r2.json()}
+
 
 @app.post("/ig/publish/video_from_cloudinary")
 async def ig_publish_video_from_cloudinary(
@@ -1207,89 +1465,141 @@ async def ig_publish_video_from_cloudinary(
 ):
     if not CLOUDINARY_CLOUD:
         raise HTTPException(400, "Cloudinary not configured: set CLOUDINARY_CLOUD")
-    base_url = f"https://res.cloudinary.com/{CLOUDINARY_CLOUD}/video/upload/{public_id}.mp4"
+    base_url = (
+        f"https://res.cloudinary.com/{CLOUDINARY_CLOUD}/video/upload/{public_id}.mp4"
+    )
     video_url = _cld_inject_transform(base_url, _CLOUD_REELS_TRANSFORM)
     # делегируем в общий обработчик
-    return await ig_publish_video(video_url=video_url, caption=caption, cover_url=cover_url, share_to_feed=share_to_feed)
+    return await ig_publish_video(
+        video_url=video_url,
+        caption=caption,
+        cover_url=cover_url,
+        share_to_feed=share_to_feed,
+    )
+
 
 # ── IG: INSIGHTS (media, smart metrics) ────────────────────────────────
 REELS_METRICS = [
-    "views", "likes", "comments", "shares", "saved",
+    "views",
+    "likes",
+    "comments",
+    "shares",
+    "saved",
     "total_interactions",
-    "ig_reels_avg_watch_time", "ig_reels_video_view_total_time",
+    "ig_reels_avg_watch_time",
+    "ig_reels_video_view_total_time",
 ]
-PHOTO_METRICS = ["impressions","reach","saved","likes","comments","shares","total_interactions"]
-CAROUSEL_METRICS = ["impressions","reach","saved","likes","comments","shares","total_interactions"]
-VIDEO_METRICS = ["views","likes","comments","shares","saved","total_interactions"]
+PHOTO_METRICS = [
+    "impressions",
+    "reach",
+    "saved",
+    "likes",
+    "comments",
+    "shares",
+    "total_interactions",
+]
+CAROUSEL_METRICS = [
+    "impressions",
+    "reach",
+    "saved",
+    "likes",
+    "comments",
+    "shares",
+    "total_interactions",
+]
+VIDEO_METRICS = ["views", "likes", "comments", "shares", "saved", "total_interactions"]
+
 
 def _pick_metrics_for_media(product_type: str) -> List[str]:
     pt = (product_type or "").upper()
-    if pt in ("REELS", "CLIPS"): return REELS_METRICS
-    if pt in ("CAROUSEL_ALBUM", "CAROUSEL"): return CAROUSEL_METRICS
-    if pt in ("IMAGE", "PHOTO"): return PHOTO_METRICS
+    if pt in ("REELS", "CLIPS"):
+        return REELS_METRICS
+    if pt in ("CAROUSEL_ALBUM", "CAROUSEL"):
+        return CAROUSEL_METRICS
+    if pt in ("IMAGE", "PHOTO"):
+        return PHOTO_METRICS
     return VIDEO_METRICS
+
 
 @app.get("/ig/insights/media")
 async def ig_media_insights(
-    media_id: str = Query(...),
-    metrics: Optional[str] = Query(None),
+    media_id: str = Query(..., description="Media ID"),
+    metrics: str = Query(
+        "", description="Comma-separated metrics; if empty — auto by media type"
+    ),
 ):
     st = await _load_state()
-    async with RetryClient() as client:        # media_type
-        r1 = await client.get(
-            f"{GRAPH_BASE}/{media_id}",
-            params={"fields": "media_type", "access_token": st["page_token"]},
-            retries=4,
-        )
+    async with RetryClient() as client:
+        # media_type
         try:
+            r1 = await client.get(
+                f"{GRAPH_BASE}/{media_id}",
+                params={"fields": "media_type", "access_token": st["page_token"]},
+                retries=4,
+            )
             r1.raise_for_status()
             media_type = (r1.json() or {}).get("media_type", "")
         except httpx.HTTPStatusError as e:
-            return {"ok": False, "stage": "get_media_type", "status": e.response.status_code, "error": e.response.json()}
+            return {
+                "ok": False,
+                "stage": "get_media_type",
+                "status": (e.response.status_code if e.response is not None else None),
+                "error": (e.response.json() if (e.response is not None) else str(e)),
+            }
 
-        # product_type (мягкая попытка)
-    product_type = None
-    try:
+        # product_type (мягко)
+        product_type = None
+        try:
             r2 = await client.get(
-            f"{GRAPH_BASE}/{media_id}",
-            params={"fields": "product_type", "access_token": st["page_token"]},
-            retries=4,
+                f"{GRAPH_BASE}/{media_id}",
+                params={"fields": "product_type", "access_token": st["page_token"]},
+                retries=4,
             )
             if r2.status_code == 200:
-                    product_type = (r2.json() or {}).get("product_type")
+                product_type = (r2.json() or {}).get("product_type")
         except Exception:
             pass
 
         mt_upper = (product_type or media_type or "").upper()
-        req_metrics = [m.strip() for m in metrics.split(",") if m.strip()] if metrics else _pick_metrics_for_media(mt_upper)
+        req_metrics = (
+            [m.strip() for m in metrics.split(",") if m.strip()]
+            if metrics
+            else _pick_metrics_for_media(mt_upper)
+        )
+
         if mt_upper in ("IMAGE", "PHOTO", "CAROUSEL", "CAROUSEL_ALBUM", "VIDEO"):
             req_metrics = [m for m in req_metrics if m != "impressions"]
 
         try:
-            ins = await client.get(f"{GRAPH_BASE}/{media_id}/insights", params={"metric": ",".join(req_metrics), "access_token": st["page_token"]})
+            ins = await client.get(
+                f"{GRAPH_BASE}/{media_id}/insights",
+                params={
+                    "metric": ",".join(req_metrics),
+                    "access_token": st["page_token"],
+                },
+            )
             ins.raise_for_status()
         except httpx.HTTPStatusError as e:
             try:
                 err_json = e.response.json()
             except Exception:
                 err_json = {}
-            msg = ((err_json or {}).get("error") or {}).get("message", "").lower()
-            if "no longer supported" in msg or "is not supported" in msg:
-                fallback = [m for m in req_metrics if m != "impressions"]
-                if fallback and fallback != req_metrics:
-                    ins = await client.get(f"{GRAPH_BASE}/{media_id}/insights", params={"metric": ",".join(fallback), "access_token": st["page_token"]})
-                    ins.raise_for_status()
-                    req_metrics = fallback
-                else:
-                    return {"ok": False, "stage": "insights", "status": e.response.status_code, "media_type": mt_upper, "metrics": req_metrics, "error": err_json}
-            else:
-                return {"ok": False, "stage": "insights", "status": e.response.status_code, "media_type": mt_upper, "metrics": req_metrics, "error": err_json}
+            return {
+                "ok": False,
+                "stage": "insights",
+                "status": (e.response.status_code if e.response is not None else None),
+                "error": err_json or str(e),
+            }
 
-        data = ins.json().get("data", [])
-        return {"ok": True, "media_type": mt_upper, "metrics": req_metrics, "data": data}
+        data = ins.json() or {}
+        return {
+            "ok": True,
+            "media_type": media_type,
+            "product_type": product_type,
+            "metrics": req_metrics,
+            "data": data,
+        }
 
-# ── IG: INSIGHTS (account) ─────────────────────────────────────────────
-ACCOUNT_INSIGHT_ALLOWED = {"impressions", "reach", "profile_views"}
 
 @app.get("/ig/insights/account")
 async def ig_account_insights(
@@ -1300,18 +1610,25 @@ async def ig_account_insights(
     req_metrics = [m.strip() for m in metrics.split(",") if m.strip()]
     bad = [m for m in req_metrics if m not in ACCOUNT_INSIGHT_ALLOWED]
     if bad:
-        raise HTTPException(400, f"Unsupported metrics: {bad}. Allowed: {sorted(ACCOUNT_INSIGHT_ALLOWED)}")
-    async with RetryClient() as client:        
-    r = await client.get(
+        raise HTTPException(
+            400,
+            f"Unsupported metrics: {bad}. Allowed: {sorted(ACCOUNT_INSIGHT_ALLOWED)}",
+        )
+
+    async with RetryClient() as client:
+        r = await client.get(
             f"{GRAPH_BASE}/{st['ig_id']}/insights",
-            params={"metric": ",".join(req_metrics), "period": period, "access_token": st["page_token"]},
+            params={
+                "metric": ",".join(req_metrics),
+                "period": period,
+                "access_token": st["page_token"],
+            },
             retries=4,
         )
         r.raise_for_status()
-        data = r.json().get("data", [])
-    return {"ok": True, "data": data}
+        return r.json()
 
-# ── Cloudinary unsigned upload helper ───────────────────────────────────
+
 @app.post("/util/cloudinary/upload")
 async def cloudinary_upload(
     file_url: str = Body(..., embed=True),
@@ -1320,11 +1637,18 @@ async def cloudinary_upload(
     public_id: Optional[str] = Body(None, embed=True),
 ):
     if not CLOUDINARY_CLOUD or not CLOUDINARY_UNSIGNED_PRESET:
-        raise HTTPException(400, "Cloudinary env missing: set CLOUDINARY_CLOUD and CLOUDINARY_UNSIGNED_PRESET")
+        raise HTTPException(
+            400,
+            "Cloudinary env missing: set CLOUDINARY_CLOUD and CLOUDINARY_UNSIGNED_PRESET",
+        )
     form = {"file": file_url, "upload_preset": CLOUDINARY_UNSIGNED_PRESET}
-    if folder: form["folder"] = folder
-    if public_id: form["public_id"] = public_id
-    endpoint = f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD}/{resource_type}/upload"
+    if folder:
+        form["folder"] = folder
+    if public_id:
+        form["public_id"] = public_id
+    endpoint = (
+        f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD}/{resource_type}/upload"
+    )
     try:
         async with httpx.AsyncClient(timeout=120) as client:
             r = await client.post(endpoint, data=form)
@@ -1347,14 +1671,15 @@ async def cloudinary_upload(
         "duration": payload.get("duration"),
     }
 
+
 @app.post("/ig/comment/after_publish")
 async def ig_comment_after_publish(
     media_id: str = Body(..., embed=True),
     message: str = Body(..., embed=True),
 ):
     st = await _load_state()
-    async with RetryClient() as client:        
-    r = await client.post(
+    async with RetryClient() as client:
+        r = await client.post(
             f"{GRAPH_BASE}/{media_id}/comments",
             data={"message": message, "access_token": st["page_token"]},
             retries=4,
@@ -1362,10 +1687,16 @@ async def ig_comment_after_publish(
         try:
             r.raise_for_status()
         except httpx.HTTPStatusError as e:
-            return {"ok": False, "stage": "comment", "error": e.response.json()}
+            return {
+                "ok": False,
+                "stage": "comment",
+                "error": e.response.json(),
+            }
         return {"ok": True, "result": r.json()}
 
+
 # === FLOW: filter → (upload to Cloudinary) → publish to IG =============
+
 
 async def _cloudinary_unsigned_upload_file(
     path: Path,
@@ -1379,9 +1710,14 @@ async def _cloudinary_unsigned_upload_file(
     Требуются ENV: CLOUDINARY_CLOUD и CLOUDINARY_UNSIGNED_PRESET.
     """
     if not CLOUDINARY_CLOUD or not CLOUDINARY_UNSIGNED_PRESET:
-        raise HTTPException(400, "Cloudinary not configured: set CLOUDINARY_CLOUD and CLOUDINARY_UNSIGNED_PRESET")
+        raise HTTPException(
+            400,
+            "Cloudinary not configured: set CLOUDINARY_CLOUD and CLOUDINARY_UNSIGNED_PRESET",
+        )
 
-    endpoint = f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD}/{resource_type}/upload"
+    endpoint = (
+        f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD}/{resource_type}/upload"
+    )
     data = {"upload_preset": CLOUDINARY_UNSIGNED_PRESET}
     if folder:
         data["folder"] = folder
@@ -1400,7 +1736,10 @@ async def _cloudinary_unsigned_upload_file(
             try:
                 err = e.response.json()
             except Exception:
-                err = {"status": e.response.status_code, "text": e.response.text[:500]}
+                err = {
+                    "status": e.response.status_code,
+                    "text": e.response.text[:500],
+                }
             raise HTTPException(502, f"Cloudinary upload failed: {err}")
         return r.json()
 
@@ -1426,7 +1765,9 @@ async def flow_filter_and_publish(
     try:
         job_obj_or_id = create_job(kind="video_filter", payload=payload)
     except TypeError:
+        # совместимость со старой сигнатурой
         job_obj_or_id = create_job(payload=payload)
+
     job_id = getattr(job_obj_or_id, "id", job_obj_or_id)
     if not isinstance(job_id, str):
         job_id = str(job_id)
@@ -1455,46 +1796,56 @@ async def flow_filter_and_publish(
         await asyncio.sleep(poll_interval_sec)
 
     if not last_status or last_status.get("status") != "DONE":
-        return {"ok": False, "stage": "filter", "job_id": job_id, "error": "timeout waiting filter result"}
+        return {
+            "ok": False,
+            "stage": "filter",
+            "job_id": job_id,
+            "error": "timeout waiting filter result",
+        }
 
     result = (get_job(job_id) or {}).get("result") or {}
     out_url_local = result.get("output_url")
     if not out_url_local:
-        return {"ok": False, "stage": "filter", "job_id": job_id, "error": "no output_url from filter"}
+        return {
+            "ok": False,
+            "stage": "filter",
+            "job_id": job_id,
+            "error": "no output_url from filter",
+        }
 
     # 3) upload to Cloudinary (unsigned)
-    #    Полезно складывать в папку проекта (не обязательно)
     try:
-
-    # 3) upload to Cloudinary (unsigned)
-    try:
-    # Превращаем output_url в абсолютный локальный путь
-    # Пример output_url: "/static/out/flt_vid_out_xxx.mp4"
-        rel = None
+        # превращаем output_url в абсолютный локальный путь
+        # пример output_url: "/static/out/flt_vid_out_xxx.mp4"
         if out_url_local.startswith("/static/"):
-            rel = out_url_local[len("/static/"):]  # "out/xxx.mp4"
+            rel = out_url_local[len("/static/") :]  # "out/xxx.mp4"
             local_path = STATIC_DIR / rel
         else:
-        # на всякий случай: возьмём basename и посмотрим в OUT_DIR
+            # на всякий случай: возьмём basename и посмотрим в OUT_DIR
             local_path = OUT_DIR / Path(out_url_local).name
 
         if not local_path.exists():
             return {
-                    "ok": False,
-                    "stage": "cloudinary",
-                    "error": f"local file not found: {local_path} (from output_url={out_url_local})"
+                "ok": False,
+                "stage": "cloudinary",
+                "error": f"local file not found: {local_path} (from output_url={out_url_local})",
             }
 
-    cld_resp = await _cloudinary_unsigned_upload_file(
+        cld_resp = await _cloudinary_unsigned_upload_file(
             local_path,
             resource_type="video",
             folder=cloudinary_folder,
         )
         secure_url = cld_resp.get("secure_url")
         if not secure_url:
-            return {"ok": False, "stage": "cloudinary", "error": "no secure_url in Cloudinary response"}
+            return {
+                "ok": False,
+                "stage": "cloudinary",
+                "error": "no secure_url in Cloudinary response",
+            }
 
     except HTTPException as he:
+        # пробрасываем как есть — FastAPI сам превратит в ответ
         raise he
     except Exception as e:
         return {"ok": False, "stage": "cloudinary", "error": str(e)}
@@ -1516,11 +1867,16 @@ async def flow_filter_and_publish(
         "ok": True,
         "job_id": job_id,
         "filtered_local": out_url_local,
-        "cloudinary": {"secure_url": secure_url, "public_id": cld_resp.get("public_id")},
+        "cloudinary": {
+            "secure_url": secure_url,
+            "public_id": cld_resp.get("public_id"),
+        },
         "publish": publish_resp,
     }
 
+
 # === FLOW: filter → cover → Cloudinary → publish =======================
+
 
 async def _cloudinary_unsigned_upload_bytes(
     data: bytes,
@@ -1531,16 +1887,40 @@ async def _cloudinary_unsigned_upload_bytes(
     public_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     if not CLOUDINARY_CLOUD or not CLOUDINARY_UNSIGNED_PRESET:
-        raise HTTPException(400, "Cloudinary not configured: set CLOUDINARY_CLOUD and CLOUDINARY_UNSIGNED_PRESET")
-    endpoint = f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD}/{resource_type}/upload"
+        raise HTTPException(
+            400,
+            "Cloudinary not configured: set CLOUDINARY_CLOUD and CLOUDINARY_UNSIGNED_PRESET",
+        )
+
+    endpoint = (
+        f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD}/{resource_type}/upload"
+    )
     form = {"upload_preset": CLOUDINARY_UNSIGNED_PRESET}
-    if folder: form["folder"] = folder
-    if public_id: form["public_id"] = public_id
-    files = {"file": (filename, data, "image/jpeg" if resource_type == "image" else "application/octet-stream")}
+    if folder:
+        form["folder"] = folder
+    if public_id:
+        form["public_id"] = public_id
+
+    files = {
+        "file": (
+            filename,
+            data,
+            "image/jpeg" if resource_type == "image" else "application/octet-stream",
+        )
+    }
+
     async with httpx.AsyncClient(timeout=300) as client:
         r = await client.post(endpoint, data=form, files=files)
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            try:
+                err = e.response.json()
+            except Exception:
+                err = {"status": e.response.status_code, "text": e.response.text[:500]}
+            raise HTTPException(502, f"Cloudinary upload failed: {err}")
         return r.json()
+
 
 @app.post("/flow/filter-publish-with-cover")
 async def flow_filter_publish_with_cover(
@@ -1552,19 +1932,26 @@ async def flow_filter_publish_with_cover(
     # cover options
     at: float = Body(1.0, embed=True, description="секунда кадра для обложки"),
     title: Optional[str] = Body(None, embed=True),
-    title_pos: str = Body("bottom", embed=True),   # bottom|top
-    title_font: Optional[str] = Body(None, embed=True),  # напр. "Inter" (если установлен)
+    title_pos: str = Body("bottom", embed=True),  # bottom | top
+    title_font: Optional[str] = Body(
+        None, embed=True
+    ),  # напр. "Inter" (если установлен)
     title_padding: int = Body(32, embed=True),
     cloudinary_folder: Optional[str] = Body(None, embed=True),
     timeout_sec: int = Body(600, embed=True),
     poll_interval_sec: float = Body(1.5, embed=True),
 ):
-    # 1) фильтруем видео (используем ваш enqueue+ожидание из flow_filter-and-publish)
+    """
+    Фильтруем видео → извлекаем кадр и рисуем титул → грузим в Cloudinary → публикуем в IG с cover.
+    Требуются ENV: IG_ACCESS_TOKEN (+страница с IG бизнес-аккаунтом) и CLOUDINARY_*.
+    """
+    # 1) фильтруем видео (enqueue + ожидание)
     payload = {"url": url, "preset": preset, "intensity": float(intensity)}
     try:
         job_obj_or_id = create_job(kind="video_filter", payload=payload)
     except TypeError:
         job_obj_or_id = create_job(payload=payload)
+
     job_id = getattr(job_obj_or_id, "id", job_obj_or_id)
     if not isinstance(job_id, str):
         job_id = str(job_id)
@@ -1574,84 +1961,149 @@ async def flow_filter_publish_with_cover(
     result = None
     while time.time() < deadline:
         j = get_job(job_id)
-        if j and (j.get("status") or "").upper() == "DONE":
-            result = j.get("result") or {}
-            break
-        if j and (j.get("status") or "").upper() == "ERROR":
-            return {"ok": False, "stage": "filter", "job_id": job_id, "error": j.get("error")}
+        if j:
+            st = (j.get("status") or "").upper()
+            if st == "DONE":
+                result = j.get("result") or {}
+                break
+            if st == "ERROR":
+                return {
+                    "ok": False,
+                    "stage": "filter",
+                    "job_id": job_id,
+                    "error": j.get("error"),
+                }
         await asyncio.sleep(poll_interval_sec)
+
     if not result or not result.get("output_url"):
-        return {"ok": False, "stage": "filter", "job_id": job_id, "error": "timeout or no output_url"}
+        return {
+            "ok": False,
+            "stage": "filter",
+            "job_id": job_id,
+            "error": "timeout or no output_url",
+        }
 
-    local_video_path = OUT_DIR / Path(result["output_url"]).name
+    # локальный путь до отфильтрованного видео
+    if str(result["output_url"]).startswith("/static/"):
+        rel = str(result["output_url"])[len("/static/") :]  # "out/xxx.mp4"
+        local_video_path = STATIC_DIR / rel
+    else:
+        local_video_path = OUT_DIR / Path(str(result["output_url"])).name
+
     if not local_video_path.exists():
-        return {"ok": False, "stage": "local_video", "error": f"not found: {local_video_path}"}
+        return {
+            "ok": False,
+            "stage": "local_video",
+            "error": f"not found: {local_video_path}",
+        }
 
-    # 2) вытаскиваем кадр (используем ваш /media/reel-cover код напрямую)
+    # 2) вытаскиваем кадр для обложки (ffmpeg)
     if not _has_ffmpeg():
         return {"ok": False, "stage": "ffmpeg", "error": "ffmpeg not available"}
+
     frame = OUT_DIR / _uuid_name("cover_frame", ".jpg")
     p = subprocess.run(
-        [FFMPEG, "-y", "-ss", str(max(0.0, at)), "-i", str(local_video_path), "-frames:v", "1", "-q:v", "2", str(frame)],
-        capture_output=True, text=True
+        [
+            FFMPEG,
+            "-y",
+            "-ss",
+            str(max(0.0, at)),
+            "-i",
+            str(local_video_path),
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+            str(frame),
+        ],
+        capture_output=True,
+        text=True,
     )
     if p.returncode != 0:
         return {"ok": False, "stage": "cover_frame", "stderr": p.stderr[-800:]}
 
-    # 3) рисуем заголовок (если задан) — используем ваш PIL стек
+    # 3) рисуем заголовок (если задан) — PIL
     cover_path = frame
     if title and PIL_OK:
         try:
             img = Image.open(frame).convert("RGBA")
             draw = ImageDraw.Draw(img)
             font = _pick_font(size=64, name=title_font)
+
             wrapped = textwrap.fill(title, width=20)
+            # оценка размеров текста
             if hasattr(draw, "multiline_textbbox"):
-                bbox = draw.multiline_textbbox((0, 0), wrapped, font=font, spacing=4, align="left")
-                tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
+                bbox = draw.multiline_textbbox(
+                    (0, 0), wrapped, font=font, spacing=4, align="left"
+                )
+                tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
             else:
                 try:
                     bbox = draw.textbbox((0, 0), wrapped, font=font)
-                    tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
+                    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
                 except Exception:
                     tw, th = draw.textsize(wrapped, font=font)
+
             pad = max(8, int(title_padding))
             if title_pos == "top":
                 xy = (pad, pad)
             else:
                 xy = (pad, img.height - th - pad)
-            bg = Image.new("RGBA", (tw + pad*2, th + pad*2), (0, 0, 0, 160))
-            img.paste(bg, (xy[0]-pad, xy[1]-pad), bg)
-            draw.multiline_text(xy, wrapped, font=font, fill=(255,255,255,255), spacing=4)
+
+            # полупрозрачный бэкграунд под текст
+            bg = Image.new("RGBA", (tw + pad * 2, th + pad * 2), (0, 0, 0, 160))
+            img.paste(bg, (xy[0] - pad, xy[1] - pad), bg)
+            draw.multiline_text(
+                xy, wrapped, font=font, fill=(255, 255, 255, 255), spacing=4
+            )
+
             cover_rgba = OUT_DIR / _uuid_name("cover", ".png")
             img.save(cover_rgba)
-            # JPEG для Cloudinary (экономия)
+
+            # JPEG для Cloudinary (экономичнее)
             cover_jpg = OUT_DIR / _uuid_name("cover", ".jpg")
             _save_image_rgb(Image.open(cover_rgba), cover_jpg, quality=92)
             cover_path = cover_jpg
-        except Exception as e:
-            # fallback — шлём исходный кадр
+        except Exception:
+            # fail-safe — шлём исходный кадр
             cover_path = frame
 
     # 4) Cloudinary: грузим видео + обложку
-    cld_video = await _cloudinary_unsigned_upload_file(
-        local_video_path, resource_type="video", folder=cloudinary_folder
-    )
-    cld_cover = await _cloudinary_unsigned_upload_file(
-        cover_path, resource_type="image", folder=cloudinary_folder
-    )
+    try:
+        cld_video = await _cloudinary_unsigned_upload_file(
+            local_video_path, resource_type="video", folder=cloudinary_folder
+        )
+        cld_cover = await _cloudinary_unsigned_upload_file(
+            cover_path, resource_type="image", folder=cloudinary_folder
+        )
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        return {"ok": False, "stage": "cloudinary", "error": str(e)}
+
     video_secure_url = cld_video.get("secure_url")
     cover_secure_url = cld_cover.get("secure_url")
     if not video_secure_url or not cover_secure_url:
-        return {"ok": False, "stage": "cloudinary", "error": "upload failed", "video_ok": bool(video_secure_url), "cover_ok": bool(cover_secure_url)}
+        return {
+            "ok": False,
+            "stage": "cloudinary",
+            "error": "upload failed",
+            "video_ok": bool(video_secure_url),
+            "cover_ok": bool(cover_secure_url),
+        }
 
     # 5) Публикуем в IG с cover_url
-    publish_resp = await ig_publish_video(
-        video_url=video_secure_url,
-        caption=caption,
-        cover_url=cover_secure_url,
-        share_to_feed=share_to_feed,
-    )
+    try:
+        publish_resp = await ig_publish_video(
+            video_url=video_secure_url,
+            caption=caption,
+            cover_url=cover_secure_url,
+            share_to_feed=share_to_feed,
+        )
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        return {"ok": False, "stage": "publish", "error": str(e)}
 
     return {
         "ok": True,
@@ -1667,9 +2119,11 @@ async def flow_filter_publish_with_cover(
         "publish": publish_resp,
     }
 
+
 # ======================================================================
 #                           MEDIA TOOLBOX
 # ======================================================================
+
 
 # 1) VALIDATE
 @app.post("/media/validate")
@@ -1694,8 +2148,13 @@ async def media_validate(
         try:
             meta = _ffprobe_json(tmp)
             info["ffprobe"] = meta
-            vstreams = [s for s in meta.get("streams", []) if s.get("codec_type") == "video"]
-            astreams = [s for s in meta.get("streams", []) if s.get("codec_type") == "audio"]
+
+            vstreams = [
+                s for s in meta.get("streams", []) if s.get("codec_type") == "video"
+            ]
+            astreams = [
+                s for s in meta.get("streams", []) if s.get("codec_type") == "audio"
+            ]
             fmt = meta.get("format", {})
             duration = float(fmt.get("duration", 0) or 0)
 
@@ -1707,14 +2166,17 @@ async def media_validate(
             if vstreams:
                 v = vstreams[0]
                 codec = v.get("codec_name")
-                width = int(v.get("width") or 0); height = int(v.get("height") or 0)
+                width = int(v.get("width") or 0)
+                height = int(v.get("height") or 0)
                 pix_fmt = v.get("pix_fmt")
+
                 fps = 0.0
                 try:
                     a, b = (v.get("r_frame_rate", "0/1") or "0/1").split("/")
                     fps = float(a) / float(b)
                 except Exception:
                     pass
+
                 if codec != "h264":
                     compatible = False
                     reasons.append(f"Video codec {codec} != h264")
@@ -1734,6 +2196,7 @@ async def media_validate(
                         reasons.append(f"Audio codec {ac} != aac (will be transcoded).")
         except Exception as e:
             return {"ok": False, "stage": "ffprobe", "error": str(e)}
+
     else:
         if not PIL_OK:
             return {"ok": False, "error": "Pillow is not installed on server."}
@@ -1742,12 +2205,21 @@ async def media_validate(
             w, h = im_raw.size
             info["image"] = {"width": w, "height": h, "mode": im_raw.mode}
             if target.upper() == "IMAGE" and max(w, h) > 2160:
-                reasons.append("Очень крупное изображение — будет ужато до 1080 по длинной стороне.")
+                reasons.append(
+                    "Очень крупное изображение — будет ужато до 1080 по длинной стороне."
+                )
         except Exception as e:
             return {"ok": False, "stage": "image_open", "error": str(e)}
 
-    return {"ok": True, "compatible": compatible, "reasons": reasons, "media_info": info, "local_url": _public_url(tmp)}
-    
+    return {
+        "ok": True,
+        "compatible": compatible,
+        "reasons": reasons,
+        "media_info": info,
+        "local_url": _public_url(tmp),
+    }
+
+
 # 2) TRANSCODE VIDEO
 @app.post("/media/transcode/video")
 async def media_transcode_video(
@@ -1766,7 +2238,7 @@ async def media_transcode_video(
     except Exception as e:
         return {"ok": False, "stage": "download", "error": str(e)}
 
-    aspect = _parse_aspect(target_aspect) or (9/16)
+    aspect = _parse_aspect(target_aspect) or (9 / 16)
     out = OUT_DIR / _uuid_name("ready", ".mp4")
 
     vf = [
@@ -1774,19 +2246,31 @@ async def media_transcode_video(
         "setsar=1",
         f"crop='min(iw,ih*{aspect}):ih'",
         f"fps={fps}" if fps > 0 else None,
-        "format=yuv420p"
+        "format=yuv420p",
     ]
     vf = [x for x in vf if x]
 
     af = ["loudnorm=I=-16:TP=-1.5:LRA=11"] if normalize_audio else []
 
     cmd = [
-        FFMPEG, "-y", "-i", str(src),
-        "-t", str(max_duration_sec),
-        "-vf", ",".join(vf),
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
+        FFMPEG,
+        "-y",
+        "-i",
+        str(src),
+        "-t",
+        str(max_duration_sec),
+        "-vf",
+        ",".join(vf),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "21",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
     ]
     if af:
         cmd += ["-af", ",".join(af)]
@@ -1796,7 +2280,8 @@ async def media_transcode_video(
     if p.returncode != 0:
         return {"ok": False, "stage": "ffmpeg", "stderr": p.stderr[-1000:]}
     return {"ok": True, "output_url": _public_url(out)}
-    
+
+
 # 3) RESIZE IMAGE
 @app.post("/media/resize/image")
 async def media_resize_image(
@@ -1821,7 +2306,11 @@ async def media_resize_image(
 
     if fit == "contain":
         if isinstance(background, str) and background.lower() == "blur":
-            bg = img.copy().resize((tw, th), RESAMPLE_LANCZOS).filter(ImageFilter.GaussianBlur(radius=24))
+            bg = (
+                img.copy()
+                .resize((tw, th), RESAMPLE_LANCZOS)
+                .filter(ImageFilter.GaussianBlur(radius=24))
+            )
             canvas = bg.convert("RGBA")
         else:
             try:
@@ -1831,12 +2320,15 @@ async def media_resize_image(
 
         img_ratio = img.width / img.height
         if img_ratio > asp:
-            nw = tw; nh = int(round(nw / img_ratio))
+            nw = tw
+            nh = int(round(nw / img_ratio))
         else:
-            nh = th; nw = int(round(nh * img_ratio))
+            nh = th
+            nw = int(round(nh * img_ratio))
 
         img_res = img.resize((nw, nh), RESAMPLE_LANCZOS)
-        x = (tw - nw) // 2; y = (th - nh) // 2
+        x = (tw - nw) // 2
+        y = (th - nh) // 2
         canvas.paste(img_res, (x, y), img_res)
         out = OUT_DIR / _uuid_name("img_resized", ".jpg")
         _save_image_rgb(canvas, out, quality=90)
@@ -1845,15 +2337,19 @@ async def media_resize_image(
     # cover
     img_ratio = img.width / img.height
     if img_ratio > asp:
-        new_w = int(round(img.height * asp)); left = (img.width - new_w) // 2
+        new_w = int(round(img.height * asp))
+        left = (img.width - new_w) // 2
         box = (left, 0, left + new_w, img.height)
     else:
-        new_h = int(round(img.width / asp)); top = (img.height - new_h) // 2
+        new_h = int(round(img.width / asp))
+        top = (img.height - new_h) // 2
         box = (0, top, img.width, top + new_h)
+
     img_c = img.crop(box).resize((tw, th), RESAMPLE_LANCZOS)
     out = OUT_DIR / _uuid_name("img_cover", ".jpg")
     _save_image_rgb(img_c, out, quality=92)
     return {"ok": True, "output_url": _public_url(out)}
+
 
 # 4) REEL COVER (grab frame + optional text)
 @app.post("/media/reel-cover")
@@ -1872,8 +2368,21 @@ async def media_reel_cover(
 
     frame = OUT_DIR / _uuid_name("cover_frame", ".jpg")
     p = subprocess.run(
-        [FFMPEG, "-y", "-ss", str(max(0.0, at)), "-i", str(src), "-frames:v", "1", "-q:v", "2", str(frame)],
-        capture_output=True, text=True
+        [
+            FFMPEG,
+            "-y",
+            "-ss",
+            str(max(0.0, at)),
+            "-i",
+            str(src),
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+            str(frame),
+        ],
+        capture_output=True,
+        text=True,
     )
     if p.returncode != 0:
         return {"ok": False, "stage": "ffmpeg", "stderr": p.stderr[-1000:]}
@@ -1882,16 +2391,21 @@ async def media_reel_cover(
         try:
             img = Image.open(frame).convert("RGBA")
             draw = ImageDraw.Draw(img)
+
             text = (overlay or {}).get("text") or ""
             pos = (overlay or {}).get("pos") or "bottom"
             padding = int((overlay or {}).get("padding") or 32)
-            font_name = (overlay or {}).get("font")  # например "Inter", "NotoSans", "OpenSans-SemiBold"
+            font_name = (overlay or {}).get(
+                "font"
+            )  # например "Inter", "NotoSans", "OpenSans-SemiBold"
             font = _pick_font(size=48, name=font_name)
 
             if text:
                 wrapped = textwrap.fill(text, width=20)
                 if hasattr(draw, "multiline_textbbox"):
-                    bbox = draw.multiline_textbbox((0, 0), wrapped, font=font, spacing=4, align="left")
+                    bbox = draw.multiline_textbbox(
+                        (0, 0), wrapped, font=font, spacing=4, align="left"
+                    )
                     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
                 else:
                     try:
@@ -1907,16 +2421,26 @@ async def media_reel_cover(
                 else:
                     xy = (padding, padding)
 
-                bg = Image.new("RGBA", (tw + padding * 2, th + padding * 2), (0, 0, 0, 160))
+                bg = Image.new(
+                    "RGBA", (tw + padding * 2, th + padding * 2), (0, 0, 0, 160)
+                )
                 img.paste(bg, (xy[0] - padding, xy[1] - padding), bg)
-                draw.multiline_text(xy, wrapped, font=font, fill=(255, 255, 255, 255), spacing=4)
+                draw.multiline_text(
+                    xy, wrapped, font=font, fill=(255, 255, 255, 255), spacing=4
+                )
 
             out = OUT_DIR / _uuid_name("cover", ".jpg")
             _save_image_rgb(img, out, quality=92)
             return {"ok": True, "cover_url": _public_url(out)}
         except Exception as e:
-            return {"ok": True, "cover_url": _public_url(frame), "note": f"PIL overlay skipped: {e}"}
+            return {
+                "ok": True,
+                "cover_url": _public_url(frame),
+                "note": f"PIL overlay skipped: {e}",
+            }
+
     return {"ok": True, "cover_url": _public_url(frame)}
+
 
 # 5) WATERMARK (image or video)
 @app.post("/media/watermark")
@@ -1944,20 +2468,28 @@ async def media_watermark(
         try:
             base = _image_open(src)
             mark = Image.open(logo).convert("RGBA")
+
             target_w = max(64, base.width // 6)
             ratio = target_w / mark.width
             mark = mark.resize((target_w, int(mark.height * ratio)), RESAMPLE_LANCZOS)
+
             if opacity < 1.0:
                 alpha = mark.split()[-1].point(lambda p: int(p * opacity))
                 mark.putalpha(alpha)
+
             if position in ("tr", "rt"):
-                x = base.width - mark.width - margin; y = margin
+                x = base.width - mark.width - margin
+                y = margin
             elif position in ("tl", "lt"):
-                x = margin; y = margin
+                x = margin
+                y = margin
             elif position in ("bl", "lb"):
-                x = margin; y = base.height - mark.height - margin
+                x = margin
+                y = base.height - mark.height - margin
             else:
-                x = base.width - mark.width - margin; y = base.height - mark.height - margin
+                x = base.width - mark.width - margin
+                y = base.height - mark.height - margin
+
             base.paste(mark, (x, y), mark)
             out = OUT_DIR / _uuid_name("wm_img", ".jpg")
             _save_image_rgb(base, out, quality=92)
@@ -1967,6 +2499,7 @@ async def media_watermark(
     else:
         if not _has_ffmpeg():
             return {"ok": False, "error": "ffmpeg not available."}
+
         pos_map = {
             "tr": f"main_w-overlay_w-{margin}:{margin}",
             "tl": f"{margin}:{margin}",
@@ -1974,22 +2507,39 @@ async def media_watermark(
             "br": f"main_w-overlay_w-{margin}:main_h-overlay_h-{margin}",
         }
         expr = pos_map.get(position, pos_map["br"])
+
         out = OUT_DIR / _uuid_name("wm_vid", ".mp4")
         cmd = [
-            FFMPEG, "-y",
-            "-i", str(src), "-i", str(logo),
-            "-filter_complex", f"[1]format=rgba,colorchannelmixer=aa={opacity}[lg];[0][lg]overlay={expr}",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
-            "-c:a", "aac", "-b:a", "128k",
-            "-movflags", "+faststart",
-            str(out)
+            FFMPEG,
+            "-y",
+            "-i",
+            str(src),
+            "-i",
+            str(logo),
+            "-filter_complex",
+            f"[1]format=rgba,colorchannelmixer=aa={opacity}[lg];[0][lg]overlay={expr}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "21",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+            str(out),
         ]
         p = subprocess.run(cmd, capture_output=True, text=True)
         if p.returncode != 0:
             return {"ok": False, "stage": "ffmpeg", "stderr": p.stderr[-1000:]}
+
         return {"ok": True, "output_url": _public_url(out)}
 
-# 6) FILTERS (image/video)
+
+# 6) FILTERS (image)
 @app.post("/media/filter/image")
 async def media_filter_image(
     url: str = Body(..., embed=True),
@@ -2021,77 +2571,81 @@ async def media_filter_image(
             m = Image.new("L", (w, h), 0)
             draw = ImageDraw.Draw(m)
             draw.ellipse((pad, pad, w - pad, h - pad), fill=255)
-            m = m.filter(ImageFilter.GaussianBlur(radius=int(min(w, h) * (0.06 + 0.12 * strength))))
+            m = m.filter(
+                ImageFilter.GaussianBlur(
+                    radius=int(min(w, h) * (0.06 + 0.12 * strength))
+                )
+            )
             dark = ImageEnhance.Brightness(base).enhance(1 - 0.25 * strength)
             return Image.composite(dark, base, m)
 
-        preset = (preset or "").lower().strip()
+        p = (preset or "").lower().strip()
 
-        if preset in ("b&w", "bw", "mono", "blackwhite"):
+        if p in ("b&w", "bw", "mono", "blackwhite"):
             out_img = img.convert("L").convert("RGB")
 
-        elif preset in ("warm", "warmth"):
+        elif p in ("warm", "warmth"):
             r, g, b = img.split()
             r = ImageEnhance.Brightness(r).enhance(1 + 0.15 * k)
             b = ImageEnhance.Brightness(b).enhance(1 - 0.10 * k)
             out_img = Image.merge("RGB", (r, g, b))
             out_img = ImageEnhance.Color(out_img).enhance(1 + 0.10 * k)
 
-        elif preset in ("cool", "cold"):
+        elif p in ("cool", "cold"):
             r, g, b = img.split()
             b = ImageEnhance.Brightness(b).enhance(1 + 0.15 * k)
             r = ImageEnhance.Brightness(r).enhance(1 - 0.10 * k)
             out_img = Image.merge("RGB", (r, g, b))
             out_img = ImageEnhance.Color(out_img).enhance(1 + 0.05 * k)
 
-        elif preset in ("boost", "pop"):
+        elif p in ("boost", "pop"):
             out_img = ImageEnhance.Contrast(img).enhance(1 + 0.35 * k)
             out_img = ImageEnhance.Color(out_img).enhance(1 + 0.35 * k)
             out_img = ImageEnhance.Sharpness(out_img).enhance(1 + 0.25 * k)
 
-        elif preset in ("cinematic", "cinema", "film"):
+        elif p in ("cinematic", "cinema", "film"):
             out_img = ImageEnhance.Contrast(img).enhance(1 + 0.15 * k)
             out_img = ImageEnhance.Color(out_img).enhance(1 + 0.12 * k)
             out_img = out_img.filter(ImageFilter.GaussianBlur(radius=0.5 * k))
             out_img = ImageEnhance.Sharpness(out_img).enhance(1 + 0.2 * k)
             out_img = _vignette(out_img, 0.5 * k)
 
-        elif preset in ("teal_orange", "teal-orange", "tealorange"):
+        elif p in ("teal_orange", "teal-orange", "tealorange"):
             out_img = ImageEnhance.Contrast(img).enhance(1 + 0.10 * k)
             out_img = ImageEnhance.Color(out_img).enhance(1 + 0.10 * k)
             out_img = _blend_color(out_img, (0, 128, 128), 0.08 * k)
             out_img = _blend_color(out_img, (255, 140, 0), 0.06 * k)
             out_img = _vignette(out_img, 0.35 * k)
 
-        elif preset in ("pastel", "soft"):
+        elif p in ("pastel", "soft"):
             out_img = ImageEnhance.Contrast(img).enhance(1 - 0.15 * k)
             out_img = ImageEnhance.Color(out_img).enhance(1 + 0.05 * k)
             glow = out_img.filter(ImageFilter.GaussianBlur(radius=2 + 4 * k))
             out_img = Image.blend(out_img, glow, 0.25 * k)
 
-        elif preset in ("matte", "fade"):
+        elif p in ("matte", "fade"):
             out_img = ImageEnhance.Contrast(img).enhance(1 - 0.20 * k)
             out_img = _blend_color(out_img, (20, 20, 20), 0.10 * k)
             out_img = ImageEnhance.Color(out_img).enhance(1 - 0.05 * k)
 
-        elif preset in ("hdr", "hdrish", "detail"):
+        elif p in ("hdr", "hdrish", "detail"):
             out_img = ImageEnhance.Sharpness(img).enhance(1 + 0.6 * k)
             out_img = ImageEnhance.Contrast(out_img).enhance(1 + 0.20 * k)
             local = out_img.filter(ImageFilter.DETAIL)
             out_img = Image.blend(out_img, local, 0.35 * k)
 
-        elif preset in ("sepia",):
+        elif p in ("sepia",):
             gray = img.convert("L")
             out_img = Image.merge("RGB", (gray, gray, gray))
             out_img = _blend_color(out_img, (112, 66, 20), 0.35 * k)
             out_img = ImageEnhance.Contrast(out_img).enhance(1 + 0.05 * k)
 
-        elif preset in ("vintage",):
+        elif p in ("vintage",):
             out_img = ImageEnhance.Color(img).enhance(1 - 0.15 * k)
             out_img = _blend_color(out_img, (230, 210, 180), 0.12 * k)
             out_img = _vignette(out_img, 0.45 * k)
 
-        elif preset in ("clarity", "structure"):
+        elif p in ("clarity", "structure"):
             hi = ImageEnhance.Sharpness(img).enhance(1 + 0.8 * k)
             lo = img.filter(ImageFilter.GaussianBlur(radius=1 + 2 * k))
             out_img = Image.blend(hi, lo, 0.15 * k)
@@ -2104,12 +2658,12 @@ async def media_filter_image(
 
         out = OUT_DIR / _uuid_name("flt_img_out", ".jpg")
         out_img.save(out, quality=92, optimize=True, progressive=True)
-        return {"ok": True, "preset": preset, "intensity": k, "output_url": _public_url(out)}
+        return {"ok": True, "preset": p, "intensity": k, "output_url": _public_url(out)}
     except Exception as e:
         return {"ok": False, "stage": "filter", "error": str(e)}
 
 
-# NEW: ставим задачу на фоновую обработку видео (очередь + статус)
+# NEW: очередь — ставим задачу на фоновую обработку видео
 @app.post("/media/filter/video")
 async def enqueue_filter_video(body: dict = Body(...)):
     """
@@ -2160,19 +2714,18 @@ async def media_filter_status(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    status_val = job.get("status")
-    data = {
+    return {
         "ok": True,
         "job_id": job_id,
         "kind": job.get("kind"),
-        "status": status_val,
+        "status": job.get("status"),
         "created_at": job.get("created_at"),
         "updated_at": job.get("updated_at"),
         "result": job.get("result"),
         "error": job.get("error"),
     }
-    return data
-            
+
+
 # 7) COMPOSITE COVER
 @app.post("/media/composite/cover")
 async def media_composite_cover(
@@ -2184,7 +2737,13 @@ async def media_composite_cover(
     if not PIL_OK:
         return {"ok": False, "error": "Pillow not installed."}
 
-    def _measure_multiline(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, spacing: int = 4, wrap_width: int = 20):
+    def _measure_multiline(
+        draw: ImageDraw.ImageDraw,
+        text: str,
+        font: ImageFont.ImageFont,
+        spacing: int = 4,
+        wrap_width: int = 20,
+    ):
         lines = []
         for para in text.split("\n"):
             para = para.strip()
@@ -2194,18 +2753,21 @@ async def media_composite_cover(
             else:
                 lines.append("")
         if hasattr(draw, "multiline_textbbox"):
-            bbox = draw.multiline_textbbox((0, 0), "\n".join(lines), font=font, spacing=spacing, align="center")
-            return bbox[2]-bbox[0], bbox[3]-bbox[1], "\n".join(lines)
+            bbox = draw.multiline_textbbox(
+                (0, 0), "\n".join(lines), font=font, spacing=spacing, align="center"
+            )
+            return bbox[2] - bbox[0], bbox[3] - bbox[1], "\n".join(lines)
         # fallback для старых PIL
-        max_w = 0; total_h = 0
+        max_w = 0
+        total_h = 0
         for i, line in enumerate(lines):
             try:
                 bbox = draw.textbbox((0, 0), line, font=font)
-                lw, lh = bbox[2]-bbox[0], bbox[3]-bbox[1]
+                lw, lh = bbox[2] - bbox[0], bbox[3] - bbox[1]
             except Exception:
                 lw, lh = draw.textsize(line, font=font)
             max_w = max(max_w, lw)
-            total_h += lh + (spacing if i < len(lines)-1 else 0)
+            total_h += lh + (spacing if i < len(lines) - 1 else 0)
         return max_w, total_h, "\n".join(lines)
 
     try:
@@ -2220,45 +2782,68 @@ async def media_composite_cover(
     except Exception as e:
         return {"ok": False, "stage": "download/open", "error": str(e)}
 
+    # фон
     try:
         if bg == "solid":
             canvas = Image.new("RGB", (w, h), "#0b0b0b")
         elif bg == "gradient":
             grad = Image.new("RGB", (1, h))
-            top = (10, 10, 10); bottom = (40, 6, 60)
+            top = (10, 10, 10)
+            bottom = (40, 6, 60)
             for y in range(h):
                 t = y / max(1, h - 1)
-                c = tuple(int(top[i]*(1-t) + bottom[i]*t) for i in range(3))
+                c = tuple(int(top[i] * (1 - t) + bottom[i] * t) for i in range(3))
                 grad.putpixel((0, y), c)
             canvas = grad.resize((w, h), RESAMPLE_LANCZOS)
         else:
-            canvas = img.copy().resize((w, h), RESAMPLE_LANCZOS).filter(ImageFilter.GaussianBlur(radius=24))
+            canvas = (
+                img.copy()
+                .resize((w, h), RESAMPLE_LANCZOS)
+                .filter(ImageFilter.GaussianBlur(radius=24))
+            )
     except Exception as e:
         return {"ok": False, "stage": "background", "error": str(e)}
 
+    # вставляем фрейм
     try:
         max_frame_h = int(h * 0.8)
         ratio = img.width / img.height
         frame_h = max_frame_h
         frame_w = int(round(frame_h * ratio))
         if frame_w > int(w * 0.9):
-            frame_w = int(w * 0.9); frame_h = int(round(frame_w / ratio))
+            frame_w = int(w * 0.9)
+            frame_h = int(round(frame_w / ratio))
         frame_res = img.resize((frame_w, frame_h), RESAMPLE_LANCZOS)
-        x = (w - frame_w) // 2; y = int(h * 0.1)
+        x = (w - frame_w) // 2
+        y = int(h * 0.1)
         canvas.paste(frame_res, (x, y))
     except Exception as e:
         return {"ok": False, "stage": "paste_frame", "error": str(e)}
 
+    # заголовок
     if title:
         try:
             rgba = canvas.convert("RGBA")
             draw = ImageDraw.Draw(rgba)
-            font = _pick_font(size=64)  # можно передать name='Inter' и т.п.
-            tw, th, wrapped = _measure_multiline(draw, title, font, spacing=4, wrap_width=20)
-            bx = (w - tw) // 2; by = y + frame_h + 24; pad = 24
-            rect = Image.new("RGBA", (max(1, tw)+pad*2, max(1, th)+pad*2), (0,0,0,160))
-            rgba.paste(rect, (bx-pad, by-pad), rect)
-            draw.multiline_text((bx, by), wrapped, font=font, fill=(255,255,255,255), spacing=4, align="center")
+            font = _pick_font(size=64)
+            tw, th, wrapped = _measure_multiline(
+                draw, title, font, spacing=4, wrap_width=20
+            )
+            bx = (w - tw) // 2
+            by = y + frame_h + 24
+            pad = 24
+            rect = Image.new(
+                "RGBA", (max(1, tw) + pad * 2, max(1, th) + pad * 2), (0, 0, 0, 160)
+            )
+            rgba.paste(rect, (bx - pad, by - pad), rect)
+            draw.multiline_text(
+                (bx, by),
+                wrapped,
+                font=font,
+                fill=(255, 255, 255, 255),
+                spacing=4,
+                align="center",
+            )
             canvas = rgba.convert("RGB")
         except Exception:
             pass
@@ -2270,20 +2855,24 @@ async def media_composite_cover(
     except Exception as e:
         return {"ok": False, "stage": "save", "error": str(e)}
 
+
 # 8) SCHEDULER (in-memory; dev)
 JOBS: Dict[str, Dict[str, Any]] = {}
 
-async def _publish_job(job_id: str, ig_id: str, page_token: str, creation_id: str, run_at: datetime):
+
+async def _publish_job(
+    job_id: str, ig_id: str, page_token: str, creation_id: str, run_at: datetime
+):
     wait = _sleep_seconds_until(run_at)
     await asyncio.sleep(wait)
     if JOBS.get(job_id, {}).get("status") == "canceled":
         return
-    async with RetryClient() as client:        
-    try:
+    async with RetryClient() as client:
+        try:
             r = await client.post(
                 f"{GRAPH_BASE}/{ig_id}/media_publish",
                 data={"creation_id": creation_id, "access_token": page_token},
-            retries=4,
+                retries=4,
             )
             r.raise_for_status()
             JOBS[job_id]["status"] = "done"
@@ -2291,6 +2880,7 @@ async def _publish_job(job_id: str, ig_id: str, page_token: str, creation_id: st
         except Exception as e:
             JOBS[job_id]["status"] = "error"
             JOBS[job_id]["error"] = str(e)
+
 
 @app.post("/ig/schedule")
 async def ig_schedule(
@@ -2300,13 +2890,26 @@ async def ig_schedule(
     st = await _load_state()
     run_at = _iso_to_utc(publish_at)
     job_id = uuid.uuid4().hex
-    JOBS[job_id] = {"status": "scheduled", "creation_id": creation_id, "publish_at": run_at.isoformat()}
-    asyncio.create_task(_publish_job(job_id, st["ig_id"], st["page_token"], creation_id, run_at))
-    return {"ok": True, "job_id": job_id, "status": "scheduled", "publish_at_utc": run_at.isoformat()}
+    JOBS[job_id] = {
+        "status": "scheduled",
+        "creation_id": creation_id,
+        "publish_at": run_at.isoformat(),
+    }
+    asyncio.create_task(
+        _publish_job(job_id, st["ig_id"], st["page_token"], creation_id, run_at)
+    )
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "status": "scheduled",
+        "publish_at_utc": run_at.isoformat(),
+    }
+
 
 @app.get("/ig/schedule")
 def ig_schedule_list():
     return {"ok": True, "jobs": JOBS}
+
 
 @app.delete("/ig/schedule/{job_id}")
 def ig_schedule_cancel(job_id: str):
@@ -2314,6 +2917,7 @@ def ig_schedule_cancel(job_id: str):
         raise HTTPException(404, "Job not found")
     JOBS[job_id]["status"] = "canceled"
     return {"ok": True}
+
 
 # 9) CAPTION SUGGEST
 @app.post("/caption/suggest")
@@ -2333,9 +2937,12 @@ def caption_suggest(
     base = f"{head} {topic}."
     hs = ""
     if hashtags:
-        hs = " " + " ".join([h if h.startswith("#") else f"#{h}" for h in hashtags[:12]])
+        hs = " " + " ".join(
+            [h if h.startswith("#") else f"#{h}" for h in hashtags[:12]]
+        )
     caption = f"{base}\n\n{cta}{hs}"
     return {"ok": True, "caption": caption}
+
 
 # 10) BATCH PUBLISH
 @app.post("/ig/publish/batch")
@@ -2350,49 +2957,117 @@ async def ig_publish_batch(
             t = (it.get("type") or "").lower()
             try:
                 if t == "image":
-                    payload = {"image_url": it["image_url"], "access_token": st["page_token"]}
-                    if it.get("caption"): payload["caption"] = it["caption"]
-                    r1 = await client.post(f"{GRAPH_BASE}/{st['ig_id']}/media", data=payload)
+                    payload = {
+                        "image_url": it["image_url"],
+                        "access_token": st["page_token"],
+                    }
+                    if it.get("caption"):
+                        payload["caption"] = it["caption"]
+
+                    r1 = await client.post(
+                        f"{GRAPH_BASE}/{st['ig_id']}/media", data=payload
+                    )
                     r1.raise_for_status()
                     creation_id = r1.json().get("id")
-                    r2 = await client.post(f"{GRAPH_BASE}/{st['ig_id']}/media_publish", data={"creation_id": creation_id, "access_token": st["page_token"]})
+
+                    r2 = await client.post(
+                        f"{GRAPH_BASE}/{st['ig_id']}/media_publish",
+                        data={
+                            "creation_id": creation_id,
+                            "access_token": st["page_token"],
+                        },
+                    )
                     r2.raise_for_status()
-                    results.append({"type": "image", "ok": True, "creation_id": creation_id, "published": r2.json()})
+                    results.append(
+                        {
+                            "type": "image",
+                            "ok": True,
+                            "creation_id": creation_id,
+                            "published": r2.json(),
+                        }
+                    )
 
                 elif t in ("video", "reel"):
                     payload = {
                         "video_url": it["video_url"],
                         "media_type": "REELS",
                         "access_token": st["page_token"],
-                        "share_to_feed": "true" if it.get("share_to_feed", True) else "false",
+                        "share_to_feed": (
+                            "true" if it.get("share_to_feed", True) else "false"
+                        ),
                     }
-                    if it.get("caption"): payload["caption"] = it["caption"]
-                    if it.get("cover_url"): payload["cover_url"] = it["cover_url"]
-                    r1 = await client.post(f"{GRAPH_BASE}/{st['ig_id']}/media", data=payload)
+                    if it.get("caption"):
+                        payload["caption"] = it["caption"]
+                    if it.get("cover_url"):
+                        payload["cover_url"] = it["cover_url"]
+
+                    r1 = await client.post(
+                        f"{GRAPH_BASE}/{st['ig_id']}/media", data=payload
+                    )
                     r1.raise_for_status()
                     creation_id = r1.json().get("id")
 
-                    done = False; waited = 0
+                    done = False
+                    waited = 0
                     while waited < 120:
-                        rs = await client.get(f"{GRAPH_BASE}/{creation_id}", params={"fields": "status_code", "access_token": st["page_token"]})
+                        rs = await client.get(
+                            f"{GRAPH_BASE}/{creation_id}",
+                            params={
+                                "fields": "status_code",
+                                "access_token": st["page_token"],
+                            },
+                        )
                         rs.raise_for_status()
                         sc = (rs.json() or {}).get("status_code")
-                        if sc == "FINISHED": done = True; break
-                        if sc == "ERROR": raise RuntimeError("Processing error")
-                        await asyncio.sleep(2); waited += 2
-                    if not done: raise RuntimeError("Processing timeout")
+                        if sc == "FINISHED":
+                            done = True
+                            break
+                        if sc == "ERROR":
+                            raise RuntimeError("Processing error")
+                        await asyncio.sleep(2)
+                        waited += 2
 
-                    r2 = await client.post(f"{GRAPH_BASE}/{st['ig_id']}/media_publish", data={"creation_id": creation_id, "access_token": st["page_token"]})
+                    if not done:
+                        raise RuntimeError("Processing timeout")
+
+                    r2 = await client.post(
+                        f"{GRAPH_BASE}/{st['ig_id']}/media_publish",
+                        data={
+                            "creation_id": creation_id,
+                            "access_token": st["page_token"],
+                        },
+                    )
                     r2.raise_for_status()
-                    results.append({"type": "reel", "ok": True, "creation_id": creation_id, "published": r2.json()})
+                    results.append(
+                        {
+                            "type": "reel",
+                            "ok": True,
+                            "creation_id": creation_id,
+                            "published": r2.json(),
+                        }
+                    )
+
                 else:
-                    results.append({"ok": False, "error": f"Unsupported type: {t}", "item": it})
+                    results.append(
+                        {"ok": False, "error": f"Unsupported type: {t}", "item": it}
+                    )
+
             except httpx.HTTPStatusError as e:
-                results.append({"ok": False, "status": e.response.status_code, "error": e.response.json(), "item": it})
+                results.append(
+                    {
+                        "ok": False,
+                        "status": e.response.status_code,
+                        "error": e.response.json(),
+                        "item": it,
+                    }
+                )
             except Exception as e:
                 results.append({"ok": False, "error": str(e), "item": it})
+
             await asyncio.sleep(max(0.0, throttle_ms / 1000.0))
+
     return {"ok": True, "results": results}
+
 
 # ── Housekeeping: cleanup old temp files ────────────────────────────────
 @app.delete("/util/cleanup")
@@ -2413,7 +3088,8 @@ def cleanup_tmp(hours: int = 12):
                 # Игнорируем частные ошибки удаления (busy, race, perms)
                 pass
     return {"ok": True, "removed": removed, "count": len(removed)}
-    
+
+
 @app.get("/util/fonts")
 def list_fonts(q: Optional[str] = None, limit: int = 100):
     idx = _font_index()
@@ -2421,8 +3097,13 @@ def list_fonts(q: Optional[str] = None, limit: int = 100):
     if q:
         ql = q.lower()
         items = [(k, v) for k, v in items if ql in k]
-    items = items[:max(1, min(limit, 500))]
-    return {"ok": True, "count": len(items), "fonts": [{"name": k, "path": v} for k, v in items]}
+    items = items[: max(1, min(limit, 500))]
+    return {
+        "ok": True,
+        "count": len(items),
+        "fonts": [{"name": k, "path": v} for k, v in items],
+    }
+
 
 # корневой пинг
 @app.get("/")
@@ -2464,12 +3145,14 @@ def root():
             "/util/cloudinary/upload",
             "/util/cleanup",
             "/util/fonts",
-        ]
+        ],
     }
-    
+
+
 if __name__ == "__main__":
     try:
         import uvicorn
+
         uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
     except Exception:
         pass
