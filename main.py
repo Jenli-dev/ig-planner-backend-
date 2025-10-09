@@ -562,7 +562,11 @@ class RetryClient(httpx.AsyncClient):
                 await asyncio.sleep(
                     backoff * (2 ** (attempt - 1)) + random.uniform(0, 0.2)
                 )
+    async def get(self, url, *, retries: int = 3, backoff: float = 0.5, **kwargs):
+        return await self.request("GET", url, retries=retries, backoff=backoff, **kwargs)
 
+    async def post(self, url, *, retries: int = 3, backoff: float = 0.5, **kwargs):
+        return await self.request("POST", url, retries=retries, backoff=backoff, **kwargs)
 
 def _uuid_name(prefix: str, ext: str) -> str:
     ext = ext if ext.startswith(".") else f".{ext}"
