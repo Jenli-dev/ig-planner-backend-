@@ -1175,41 +1175,44 @@ async def ig_comment_hide(
     comment_id: str = Body(..., embed=True), hide: bool = Body(default=True, embed=True)
 ):
     st = await _load_state()
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.post(
-            f"{GRAPH_BASE}/{comment_id}",
-            data={
-                "hide": "true" if hide else "false",
-                "access_token": st["page_token"],
-            },
-        )
+    async with RetryClient() as client:
         try:
+            r = await client.post(
+                f"{GRAPH_BASE}/{comment_id}",
+                data={
+                    "hide": "true" if hide else "false",
+                    "access_token": st["page_token"],
+                },
+                retries=4,
+            )
             r.raise_for_status()
+            return {"ok": True}
         except httpx.HTTPStatusError as e:
             return {
                 "ok": False,
-                "status": e.response.status_code,
-                "error": e.response.json(),
+                "status": (e.response.status_code if e.response else None),
+                "error": (e.response.json() if e.response else str(e)),
             }
-    return {"ok": True}
 
 
 @app.post("/ig/comments/delete")
 async def ig_comment_delete(comment_id: str = Body(..., embed=True)):
     st = await _load_state()
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.delete(
-            f"{GRAPH_BASE}/{comment_id}", params={"access_token": st["page_token"]}
-        )
+    async with RetryClient() as client:
         try:
+            r = await client.delete(
+                f"{GRAPH_BASE}/{comment_id}",
+                params={"access_token": st["page_token"]},
+                retries=4,
+            )
             r.raise_for_status()
+            return {"ok": True}
         except httpx.HTTPStatusError as e:
             return {
                 "ok": False,
-                "status": e.response.status_code,
-                "error": e.response.json(),
+                "status": (e.response.status_code if e.response else None),
+                "error": (e.response.json() if e.response else str(e)),
             }
-    return {"ok": True}
 
 
 @app.post("/ig/comments/reply-many")
@@ -1220,29 +1223,28 @@ async def ig_comments_reply_many(
 ):
     st = await _load_state()
     results = []
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with RetryClient() as client:
         for cid in comment_ids:
             try:
                 r = await client.post(
                     f"{GRAPH_BASE}/{cid}/replies",
                     data={"access_token": st["page_token"], "message": message},
+                    retries=4,
                 )
                 r.raise_for_status()
-                results.append(
-                    {"comment_id": cid, "ok": True, "id": r.json().get("id")}
-                )
+                results.append({"comment_id": cid, "ok": True, "id": r.json().get("id")})
             except httpx.HTTPStatusError as e:
                 results.append(
                     {
                         "comment_id": cid,
                         "ok": False,
-                        "status": e.response.status_code,
-                        "error": e.response.json(),
+                        "status": (e.response.status_code if e.response else None),
+                        "error": (e.response.json() if e.response else str(e)),
                     }
                 )
             await asyncio.sleep(max(0.0, delay_ms / 1000.0))
     return {"ok": True, "results": results}
-
+    
 
 # ── IG: PUBLISH (image) ─────────────────────────────────────────────────
 @app.post("/ig/publish/image")
@@ -1251,36 +1253,41 @@ async def ig_publish_image(
     caption: Optional[str] = Body(default=None, embed=True),
 ):
     st = await _load_state()
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with RetryClient() as client:
         try:
             payload = {"image_url": image_url, "access_token": st["page_token"]}
             if caption:
                 payload["caption"] = caption
-            r1 = await client.post(f"{GRAPH_BASE}/{st['ig_id']}/media", data=payload)
+
+            r1 = await client.post(
+                f"{GRAPH_BASE}/{st['ig_id']}/media",
+                data=payload,
+                retries=4,
+                timeout=60,
+            )
             r1.raise_for_status()
             creation_id = r1.json().get("id")
             if not creation_id:
-                return {
-                    "ok": False,
-                    "stage": "create",
-                    "error": "No creation_id in response",
-                }
+                return {"ok": False, "stage": "create", "error": "No creation_id in response"}
 
             r2 = await client.post(
                 f"{GRAPH_BASE}/{st['ig_id']}/media_publish",
                 data={"creation_id": creation_id, "access_token": st["page_token"]},
+                retries=4,
+                timeout=60,
             )
             r2.raise_for_status()
             return {"ok": True, "creation_id": creation_id, "published": r2.json()}
+
         except httpx.HTTPStatusError as e:
             try:
                 err_json = e.response.json()
             except Exception:
-                err_json = {"raw": e.response.text[:500]}
+                err_json = {"raw": (e.response.text[:500] if e.response else str(e))}
             return {
                 "ok": False,
                 "stage": "graph",
-                "status": e.response.status_code,
+                "status": (e.response.status_code if e.response else None),
                 "error": err_json,
             }
         except Exception as e:
@@ -1298,7 +1305,7 @@ async def ig_publish_video(
     video_url = _cld_inject_transform(video_url, _CLOUD_REELS_TRANSFORM)
     st = await _load_state()
 
-    async with httpx.AsyncClient(timeout=180) as client:
+    async with RetryClient() as client:
         payload = {
             "access_token": st["page_token"],
             "video_url": video_url,
@@ -1310,21 +1317,28 @@ async def ig_publish_video(
         if cover_url:
             payload["cover_url"] = cover_url
 
-        r1 = await client.post(f"{GRAPH_BASE}/{st['ig_id']}/media", data=payload)
+        # 1) создать контейнер
         try:
+            r1 = await client.post(
+                f"{GRAPH_BASE}/{st['ig_id']}/media",
+                data=payload,
+                retries=4,
+                timeout=180,
+            )
             r1.raise_for_status()
         except httpx.HTTPStatusError as e:
             return {
                 "ok": False,
                 "stage": "create_container",
-                "status": e.response.status_code,
-                "error": e.response.json(),
+                "status": (e.response.status_code if e.response else None),
+                "error": (e.response.json() if e.response else str(e)),
             }
+
         creation_id = (r1.json() or {}).get("id")
         if not creation_id:
             raise HTTPException(500, "Failed to create video container")
 
-        # Ждём обработку
+        # 2) ожидание обработки
         max_wait_sec = 150
         sleep_sec = 2
         waited = 0
@@ -1334,10 +1348,9 @@ async def ig_publish_video(
         while waited < max_wait_sec:
             rstat = await client.get(
                 f"{GRAPH_BASE}/{creation_id}",
-                params={
-                    "fields": "status,status_code",
-                    "access_token": st["page_token"],
-                },
+                params={"fields": "status,status_code", "access_token": st["page_token"]},
+                retries=4,
+                timeout=60,
             )
             try:
                 rstat.raise_for_status()
@@ -1345,10 +1358,11 @@ async def ig_publish_video(
                 return {
                     "ok": False,
                     "stage": "check_status",
-                    "status": e.response.status_code,
+                    "status": (e.response.status_code if e.response else None),
                     "creation_id": creation_id,
-                    "error": e.response.json(),
+                    "error": (e.response.json() if e.response else str(e)),
                 }
+
             payload_stat = rstat.json() or {}
             status_code = payload_stat.get("status_code") or "IN_PROGRESS"
             status_text = payload_stat.get("status")
@@ -1375,20 +1389,24 @@ async def ig_publish_video(
                 "waited_sec": waited,
             }
 
-        r2 = await client.post(
-            f"{GRAPH_BASE}/{st['ig_id']}/media_publish",
-            data={"creation_id": creation_id, "access_token": st["page_token"]},
-        )
+        # 3) публикация
         try:
+            r2 = await client.post(
+                f"{GRAPH_BASE}/{st['ig_id']}/media_publish",
+                data={"creation_id": creation_id, "access_token": st["page_token"]},
+                retries=4,
+                timeout=60,
+            )
             r2.raise_for_status()
         except httpx.HTTPStatusError as e:
             return {
                 "ok": False,
                 "stage": "publish",
-                "status": e.response.status_code,
+                "status": (e.response.status_code if e.response else None),
                 "creation_id": creation_id,
-                "error": e.response.json(),
+                "error": (e.response.json() if e.response else str(e)),
             }
+
         return {"ok": True, "creation_id": creation_id, "published": r2.json()}
 
 
@@ -1554,27 +1572,59 @@ async def ig_account_insights(
     metrics: str = Query("impressions,reach,profile_views"),
     period: str = Query("day"),
 ):
+    """
+    Возвращает аккаунт-инсайты и НИКОГДА не роняет 500 из-за 400 от Graph.
+    Если Graph вернул 400/403 и т.п. — отдаём {ok:false, ...} с подробностями.
+    """
     st = await _load_state()
     req_metrics = [m.strip() for m in metrics.split(",") if m.strip()]
+
     bad = [m for m in req_metrics if m not in ACCOUNT_INSIGHT_ALLOWED]
     if bad:
-        raise HTTPException(
-            400,
-            f"Unsupported metrics: {bad}. Allowed: {sorted(ACCOUNT_INSIGHT_ALLOWED)}",
-        )
+        return {
+            "ok": False,
+            "stage": "validate",
+            "error": f"Unsupported metrics: {bad}. Allowed: {sorted(ACCOUNT_INSIGHT_ALLOWED)}",
+        }
+
+    # допустимые периоды у IG: day | week | days_28
+    allowed_periods = {"day", "week", "days_28"}
+    if period not in allowed_periods:
+        return {
+            "ok": False,
+            "stage": "validate",
+            "error": f"Unsupported period: {period}. Allowed: {sorted(allowed_periods)}",
+        }
 
     async with RetryClient() as client:
-        r = await client.get(
-            f"{GRAPH_BASE}/{st['ig_id']}/insights",
-            params={
-                "metric": ",".join(req_metrics),
+        try:
+            r = await client.get(
+                f"{GRAPH_BASE}/{st['ig_id']}/insights",
+                params={
+                    "metric": ",".join(req_metrics),
+                    "period": period,
+                    "access_token": st["page_token"],
+                },
+                retries=4,
+            )
+            r.raise_for_status()
+            data = r.json() or {}
+            return {"ok": True, "metrics": req_metrics, "period": period, "data": data}
+        except httpx.HTTPStatusError as e:
+            # Вернём понятную ошибку от Graph (частый кейс: «metric not available for this period»)
+            try:
+                err = e.response.json()
+            except Exception:
+                err = {"status": e.response.status_code, "text": (e.response.text[:500] if e.response else str(e))}
+            return {
+                "ok": False,
+                "stage": "graph_account_insights",
+                "status": (e.response.status_code if e.response else None),
+                "metrics": req_metrics,
                 "period": period,
-                "access_token": st["page_token"],
-            },
-            retries=4,
-        )
-        r.raise_for_status()
-        return r.json()
+                "error": err,
+                "hint": "Попробуй другой period (week/days_28) или метрику. На свежих аккаунтах day часто пустой.",
+            }
 
 
 @app.post("/util/cloudinary/upload")
