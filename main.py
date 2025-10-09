@@ -567,6 +567,14 @@ class RetryClient(httpx.AsyncClient):
 
     async def post(self, url, *, retries: int = 3, backoff: float = 0.5, **kwargs):
         return await self.request("POST", url, retries=retries, backoff=backoff, **kwargs)
+    async def delete(self, url, *, retries: int = 3, backoff: float = 0.5, **kwargs):
+        return await self.request("DELETE", url, retries=retries, backoff=backoff, **kwargs)
+
+    async def put(self, url, *, retries: int = 3, backoff: float = 0.5, **kwargs):
+        return await self.request("PUT", url, retries=retries, backoff=backoff, **kwargs)
+
+    async def patch(self, url, *, retries: int = 3, backoff: float = 0.5, **kwargs):
+        return await self.request("PATCH", url, retries=retries, backoff=backoff, **kwargs)
 
 def _uuid_name(prefix: str, ext: str) -> str:
     ext = ext if ext.startswith(".") else f".{ext}"
@@ -1199,20 +1207,20 @@ async def ig_comment_hide(
 async def ig_comment_delete(comment_id: str = Body(..., embed=True)):
     st = await _load_state()
     async with RetryClient() as client:
+        r = await client.delete(
+            f"{GRAPH_BASE}/{comment_id}",
+            params={"access_token": st["page_token"]},
+            retries=4,
+        )
         try:
-            r = await client.delete(
-                f"{GRAPH_BASE}/{comment_id}",
-                params={"access_token": st["page_token"]},
-                retries=4,
-            )
             r.raise_for_status()
-            return {"ok": True}
         except httpx.HTTPStatusError as e:
             return {
                 "ok": False,
-                "status": (e.response.status_code if e.response else None),
-                "error": (e.response.json() if e.response else str(e)),
+                "status": e.response.status_code,
+                "error": e.response.json(),
             }
+    return {"ok": True}
 
 
 @app.post("/ig/comments/reply-many")
