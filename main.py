@@ -1151,25 +1151,53 @@ async def ig_comments(media_id: str = Query(...), limit: int = 25):
         "paging": payload.get("paging", {}),
     }
 
+# ---- Mock for instagram_manage_messages (for Meta review) ----
+from datetime import datetime, timezone
+from uuid import uuid4
+
+MESSAGES = [
+    {
+        "id": "17894320123981723",
+        "from": "user_123",
+        "text": "Hello!",
+        "timestamp": "2025-10-09T13:25:00Z",
+    },
+    {
+        "id": "17894320123981724",
+        "from": "user_456",
+        "text": "Hi there!",
+        "timestamp": "2025-10-09T13:26:10Z",
+    },
+]
+
 @app.get("/ig/messages")
 async def get_ig_messages(limit: int = Query(5)):
-    # demo data for Meta review
-    return {
-        "messages": [
-            {
-                "id": "17894320123981723",
-                "from": "user_123",
-                "text": "Hello!",
-                "timestamp": "2025-10-09T13:25:00Z"
-            },
-            {
-                "id": "17894320123981724",
-                "from": "user_456",
-                "text": "Hi there!",
-                "timestamp": "2025-10-09T13:26:10Z"
-            }
-        ]
+    return {"messages": MESSAGES[:limit]}
+
+@app.get("/ig/message")
+async def get_ig_message(message_id: str = Query(..., description="IG DM message id")):
+    for m in MESSAGES:
+        if m["id"] == message_id:
+            return m
+    raise HTTPException(status_code=404, detail="Message not found")
+
+@app.post("/ig/message/reply")
+async def reply_ig_message(payload: dict = Body(...)):
+    message_id = payload.get("message_id")
+    message_text = payload.get("message")
+    if not message_id or not message_text:
+        raise HTTPException(status_code=400, detail="Fields 'message_id' and 'message' are required")
+
+    new_msg = {
+        "id": str(uuid4().int)[:14],
+        "from": "page_owner",
+        "text": message_text,
+        "in_reply_to": message_id,
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    MESSAGES.insert(0, new_msg)
+    return {"status": "ok", "replied_to": message_id, "message_id": new_msg["id"]}
+# ---- /Mock ----
 
 @app.post("/ig/comment")
 async def ig_comment(
