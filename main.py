@@ -1151,6 +1151,25 @@ async def ig_comments(media_id: str = Query(...), limit: int = 25):
         "paging": payload.get("paging", {}),
     }
 
+@app.get("/ig/messages")
+async def get_ig_messages(limit: int = Query(5)):
+    # demo data for Meta review
+    return {
+        "messages": [
+            {
+                "id": "17894320123981723",
+                "from": "user_123",
+                "text": "Hello!",
+                "timestamp": "2025-10-09T13:25:00Z"
+            },
+            {
+                "id": "17894320123981724",
+                "from": "user_456",
+                "text": "Hi there!",
+                "timestamp": "2025-10-09T13:26:10Z"
+            }
+        ]
+    }
 
 @app.post("/ig/comment")
 async def ig_comment(
