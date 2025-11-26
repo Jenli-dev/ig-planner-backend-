@@ -913,6 +913,40 @@ async def auth_callback(
 ):
     return await oauth_callback(code=code, state=state, error=error)
 
+# ───────────────────────────────────────────────────────────────
+#   INSTAGRAM WEBHOOK (VERIFY + EVENTS)
+#   Endpoint for Meta Review: /webhooks/instagram
+# ───────────────────────────────────────────────────────────────
+
+VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "my_verify_token").strip()
+
+
+@app.get("/webhooks/instagram")
+async def instagram_webhook_verify(
+    hub_mode: str = Query(None, alias="hub.mode"),
+    hub_challenge: str = Query(None, alias="hub.challenge"),
+    hub_verify_token: str = Query(None, alias="hub.verify_token"),
+):
+    """
+    Step 1: Webhook verify (GET) — Meta calls this once.
+    We must return hub.challenge exactly.
+    """
+    if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
+        return int(hub_challenge or "0")
+    raise HTTPException(status_code=403, detail="Verification failed")
+
+
+@app.post("/webhooks/instagram")
+async def instagram_webhook_events(payload: dict):
+    """
+    Step 2: Meta sends events here (POST)
+    For Review, we must accept any payload and return 200 OK.
+    """
+    print("=== IG WEBHOOK EVENT ===")
+    print(json.dumps(payload, indent=2))
+
+    # For safety: ALWAYS return 200
+    return {"status": "received", "ok": True}
 
 # ── Token tools: refresh & info ────────────────────────────────────────
 @app.get("/auth/token-info")
