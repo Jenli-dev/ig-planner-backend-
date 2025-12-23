@@ -1799,7 +1799,7 @@ def list_fonts(q: Optional[str] = None, limit: int = 100):
 
 
 # корневой пинг
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {
         "ok": True,
