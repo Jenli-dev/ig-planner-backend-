@@ -15,8 +15,8 @@ from pathlib import Path
 import random
 
 import httpx
-from fastapi import FastAPI, HTTPException, Body, Query
-from fastapi.responses import RedirectResponse, PlainTextResponse
+from fastapi import FastAPI, HTTPException, Body, Query, Response
+from fastapi.responses import RedirectResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from datetime import datetime, timezone
 from config import settings
@@ -1799,7 +1799,7 @@ def list_fonts(q: Optional[str] = None, limit: int = 100):
 
 
 # корневой пинг
-@app.api_route("/", methods=["GET", "HEAD"])
+@app.get("/")
 def root():
     return {
         "ok": True,
@@ -1823,14 +1823,8 @@ def root():
             "/ig/insights/media",
             "/ig/insights/account",
             "/media/validate",
-            "/media/transcode/video",
-            "/media/resize/image",
-            "/media/reel-cover",
-            "/media/watermark",
-            "/media/filter/image",
             "/media/filter/video",
             "/media/filter/status",
-            "/media/composite/cover",
             "/ig/schedule",
             "/caption/suggest",
             "/ig/publish/batch",
@@ -1840,6 +1834,11 @@ def root():
             "/util/fonts",
         ],
     }
+
+
+@app.head("/")
+def root_head():
+    return Response(status_code=200)
 
 
 if __name__ == "__main__":
