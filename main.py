@@ -16,759 +16,63 @@ import random
 
 import httpx
 from fastapi import FastAPI, HTTPException, Body, Query
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
-from dotenv import load_dotenv
 from datetime import datetime, timezone
+from config import settings
+from health_router import router as health_router
+from media_router import router as media_router
+from http_client import RetryClient, DEFAULT_TIMEOUT
+from ffmpeg_utils import FFMPEG, FFPROBE, has_ffmpeg, ffmpeg_has_filter, ffprobe_json
+from fonts_utils import PIL_OK, pick_font, font_index
+from file_utils import uuid_name, ext_from_url, public_url, download_to
+from time_utils import now_utc, iso_to_utc, sleep_seconds_until
+from cloudinary_utils import (
+    cld_inject_transform,
+    CLOUD_REELS_TRANSFORM,
+    cloudinary_unsigned_upload_file,
+    cloudinary_unsigned_upload_bytes,
+)
+from meta_config import *
+from paths import STATIC_DIR, UPLOAD_DIR, OUT_DIR, ensure_dirs
+ensure_dirs()
 
-# OPTIONAL: Pillow (без жёсткой зависимости)
+# Pillow modules (не трогаем PIL_OK — он приходит из fonts_utils)
 try:
-    from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
-
-    PIL_OK = True
+    from PIL import Image, ImageDraw, ImageFilter, ImageEnhance
 except Exception:
-    PIL_OK = False
-    Image = None  # чтобы не было NameError, если ниже случайно обратимся
+    Image = None  # type: ignore
+    ImageDraw = None  # type: ignore
+    ImageFilter = None  # type: ignore
+    ImageEnhance = None  # type: ignore
 
-# Pillow 10+ compatibility for resampling
-if PIL_OK:
-    try:
-        RESAMPLE_LANCZOS = Image.Resampling.LANCZOS  # Pillow >=10
-    except Exception:
-        # Pillow <10 (или нет атрибута Resampling)
-        RESAMPLE_LANCZOS = getattr(Image, "LANCZOS", getattr(Image, "BICUBIC", 3))
-else:
-    RESAMPLE_LANCZOS = None
+# Pillow 10+ resampling constant (если Image доступен)
+try:
+    RESAMPLE_LANCZOS = Image.Resampling.LANCZOS  # type: ignore[attr-defined]
+except Exception:
+    RESAMPLE_LANCZOS = getattr(Image, "LANCZOS", getattr(Image, "BICUBIC", 3)) if Image else None
+    
 # ── ENV ────────────────────────────────────────────────────────────────
-load_dotenv()  # локально читает .env; на Render переменные берутся из Settings
+# Источник правды: meta_config.py + settings (config.py)
+# load_dotenv() здесь не нужен.
 
-# Meta / OAuth
-APP_ID = os.getenv("META_APP_ID", "").strip()
-APP_SECRET = os.getenv("META_APP_SECRET", "").strip()
-REDIRECT_URI = os.getenv("META_REDIRECT_URI", "").strip()
-META_AUTH = "https://www.facebook.com/v21.0/dialog/oauth"
-META_GRAPH = "https://graph.facebook.com/v21.0"
-
-# Алиасы для совместимости со старым кодом
-GRAPH_BASE = META_GRAPH
-ME_URL = f"{META_GRAPH}/me"
-TOKEN_URL = f"{META_GRAPH}/oauth/access_token"
-
-# Instagram / Cloudinary / прочее
-IG_LONG_TOKEN = os.getenv("IG_ACCESS_TOKEN", "").strip()  # длинный user/page токен
-PAGE_ID_ENV = os.getenv("PAGE_ID", "").strip()  # можно не задавать
-
-CLOUDINARY_CLOUD = os.getenv("CLOUDINARY_CLOUD", "").strip()
-CLOUDINARY_UNSIGNED_PRESET = os.getenv("CLOUDINARY_UNSIGNED_PRESET", "").strip()
-JWT_SECRET = os.getenv("JWT_SECRET", "super_secret_key").strip()
+# Эти имена уже импортированы из meta_config через `from meta_config import *`
+# Оставляем их как есть, чтобы старый код ниже работал без переписывания.
 
 # Для /oauth/start
 STATE_STORE = set()
 
-
-# ---- resolve ffmpeg/ffprobe binaries (Homebrew, /usr/local, PATH)
-def _pick_bin(*candidates: str) -> str:
-    for c in candidates:
-        if isinstance(c, str) and c:
-            p = Path(c)
-            if p.is_absolute() and p.exists():
-                return c
-            w = shutil.which(c)
-            if w:
-                return w
-    return candidates[-1] if candidates else "ffmpeg"
-
-
-FFMPEG = _pick_bin(
-    os.getenv("FFMPEG_BIN"),
-    "ffmpeg",
-    "/opt/homebrew/bin/ffmpeg",
-    "/usr/local/bin/ffmpeg",
-)
-FFPROBE = _pick_bin(
-    os.getenv("FFPROBE_BIN"),
-    "ffprobe",
-    "/opt/homebrew/bin/ffprobe",
-    "/usr/local/bin/ffprobe",
-)
-
-
-def _has_ffmpeg() -> bool:
-    try:
-        subprocess.run(
-            [FFMPEG, "-version"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        subprocess.run(
-            [FFPROBE, "-version"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        return True
-    except Exception:
-        return False
-
-
-# ── ffmpeg: фильтры (кеш доступности) ──────────────────────────────────
-_FFMPEG_FILTERS_CACHE: Optional[set] = None
-
-
-def _ffmpeg_available_filters() -> set:
-    """
-    Возвращает множество имён доступных видеофильтров ffmpeg.
-    Кешируется на время жизни процесса.
-    """
-    global _FFMPEG_FILTERS_CACHE
-    if _FFMPEG_FILTERS_CACHE is not None:
-        return _FFMPEG_FILTERS_CACHE
-    try:
-        p = subprocess.run(
-            [FFMPEG, "-hide_banner", "-filters"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        names = set()
-        for line in (p.stdout or "").splitlines():
-            line = line.strip()
-            if not line or line.startswith(("#", "-", "Filters:")):
-                continue
-            parts = line.split()
-            if len(parts) >= 2:
-                cand = parts[1].strip()
-                if cand and all(ch.isalnum() or ch in "._-" for ch in cand):
-                    names.add(cand)
-        _FFMPEG_FILTERS_CACHE = names
-    except Exception:
-        _FFMPEG_FILTERS_CACHE = set()
-    return _FFMPEG_FILTERS_CACHE
-
-
-def _ffmpeg_has_filter(name: str) -> bool:
-    """Проверяет наличие конкретного фильтра ffmpeg (с кешем)."""
-    return name in _ffmpeg_available_filters()
-
-
-# --- Cloudinary auto-transform for Reels (если прислали прямой Cloudinary URL)
-def _cld_inject_transform(url: str, transform: str) -> str:
-    marker = "/upload/"
-    if "res.cloudinary.com" in url and marker in url and "/video/" in url:
-        host, rest = url.split(marker, 1)
-        first_seg = rest.split("/", 1)[0]
-        if "," in first_seg:
-            return url
-        return f"{host}{marker}{transform}/{rest}"
-    return url
-
-
-# Рекомендуемая трансформация для Reels
-_CLOUD_REELS_TRANSFORM = (
-    "c_fill,w_1080,h_1920,fps_30,vc_h264:baseline,br_3500k,ac_aac/so_0:20/f_mp4"
-)
-
-# Важно: публикация контента, комментарии, инсайты, страницы
-SCOPES = ",".join(
-    [
-        "pages_show_list",
-        "instagram_basic",
-        "pages_read_engagement",
-        "instagram_manage_insights",
-        "pages_manage_metadata",
-        "business_management",
-        "instagram_manage_comments",
-        "instagram_content_publish",
-    ]
-)
-
-# ── static dirs ────────────────────────────────────────────────────────
-BASE_DIR = Path(__file__).resolve().parent
-STATIC_DIR = BASE_DIR / "static"
-UPLOAD_DIR = STATIC_DIR / "uploads"
-OUT_DIR = STATIC_DIR / "out"
-for d in [STATIC_DIR, UPLOAD_DIR, OUT_DIR]:
-    d.mkdir(parents=True, exist_ok=True)
-
-app = FastAPI()
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-
-# --- worker loop + video processor (совместимо с новым jobs.py) ---
-
-
-# === background jobs ===
-VIDEO_WORKERS = int(os.getenv("VIDEO_WORKERS", "1"))
-job_queue: asyncio.Queue[str] = asyncio.Queue()
-app.state.worker_tasks: list[asyncio.Task] = []
-
-
-async def _worker_loop():
-    while True:
-        job_id = await job_queue.get()
-        try:
-            job = get_job(job_id)
-            if not job:
-                continue
-
-            update_job_status(job_id, RUNNING)
-            # передаём job_id и payload
-            result = await _process_video_task(job_id, job["payload"])
-
-            # если обработчик сам не проставил DONE — делаем здесь
-            j = get_job(job_id)
-            if j and j["status"] not in (DONE, ERROR):
-                update_job_status(job_id, DONE, result=result)
-        except Exception as e:
-            update_job_status(job_id, ERROR, error=str(e))
-        finally:
-            job_queue.task_done()
-
-
-async def _process_video_task(job_id: str, payload: Dict) -> Dict:
-    """
-    Скачивает видео, собирает цепочку фильтров и прогоняет ffmpeg,
-    обновляя прогресс в jobs: downloading → preparing → encoding (с % до 100).
-    Требуются хелперы/константы: _has_ffmpeg, _download_to, _uuid_name,
-    _ext_from_url, _ffmpeg_has_filter, _public_url, _ffprobe_json,
-    а также FFMPEG, UPLOAD_DIR, OUT_DIR, update_job_status.
-    """
-    # --- импорт локальный на всякий
-
-    # 0) старт: объявим прогресс
-    update_job_status(job_id, RUNNING, result={"stage": "downloading", "progress": 10})
-
-    url = payload["url"]
-    preset = payload.get("preset", "cinematic")
-    intensity = float(payload.get("intensity", 0.7))
-
-    if not _has_ffmpeg():
-        update_job_status(job_id, ERROR, error="ffmpeg not available")
-        raise RuntimeError("ffmpeg not available")
-
-    # 1) скачать исходник
-    src = UPLOAD_DIR / _uuid_name("flt_vid", _ext_from_url(url, ".mp4"))
-    await _download_to(url, src)
-    update_job_status(
-        job_id, RUNNING, result={"stage": "preparing_filters", "progress": 30}
-    )
-
-    # 2) нормализуем интенсивность
-    k = max(0.0, min(1.0, intensity))
-
-    def _chain(*filters: str) -> str:
-        return ",".join([f for f in filters if f and str(f).strip()])
-
-    pkey = (preset or "cinematic").lower().strip()
-
-    # 3) словарь фильтров
-    vf_map: Dict[str, str] = {
-        "b&w": "hue=s=0",
-        "warm": _chain(
-            f"curves=red='0/0 {0.50}/{0.60+0.20*k:.3f} 1/1'",
-            f"curves=blue='0/0 {0.40}/{0.30-0.20*k:.3f} 1/1'",
-            f"eq=saturation={1+0.05*k:.3f}",
-        ),
-        "cool": _chain(
-            f"curves=blue='0/0 {0.50}/{0.60+0.20*k:.3f} 1/1'",
-            f"curves=red='0/0 {0.40}/{0.30-0.20*k:.3f} 1/1'",
-            f"eq=saturation={1+0.03*k:.3f}",
-        ),
-        "boost": _chain(
-            f"eq=contrast={1+0.25*k:.3f}:saturation={1+0.25*k:.3f}:brightness={0.02*k:.3f}",
-            "unsharp",
-        ),
-        "cinematic": _chain(
-            f"eq=contrast={1+0.12*k:.3f}:saturation={1+0.12*k:.3f}",
-            f"gblur=sigma={0.30+0.70*k:.3f}",
-            "unsharp",
-            "vignette",
-        ),
-        "teal_orange": _chain(
-            f"colorbalance=bs={-0.20*k:.3f}:gs=0:rs={0.10*k:.3f}",
-            f"eq=saturation={1+0.10*k:.3f}",
-            "vignette",
-        ),
-        "vignette": _chain("vignette"),
-        "matte": _chain(
-            f"eq=contrast={1-0.18*k:.3f}:saturation={1-0.05*k:.3f}",
-        ),
-        "pastel": _chain(
-            f"eq=contrast={1-0.15*k:.3f}:saturation={1+0.05*k:.3f}",
-            f"gblur=sigma={1.00+2.00*k:.3f}",
-        ),
-        "hdr": _chain(
-            f"unsharp=luma_msize_x=7:luma_msize_y=7:luma_amount={1.0+1.2*k:.3f}",
-            f"eq=contrast={1+0.20*k:.3f}",
-        ),
-        "sepia": _chain(
-            "colorchannelmixer=.393:.769:.189:0:.349:.686:.168:0:.272:.534:.131:0:0:0:0:1",
-            f"eq=contrast={1-0.18*k:.3f}:saturation={1-0.05*k:.3f}",
-        ),
-        "bleach_bypass": _chain(
-            f"eq=saturation={1-0.35*k:.3f}:contrast={1+0.30*k:.3f}",
-            f"noise=alls={5+20*k:.0f}:allf=t+u",
-        ),
-        "grain": _chain(
-            f"noise=alls={10+50*k:.0f}:allf=t+u",
-        ),
-        "clarity": _chain(
-            f"unsharp=luma_msize_x=7:luma_msize_y=7:luma_amount={1.0+1.8*k:.3f}",
-        ),
-        "fade_soft": _chain(
-            f"eq=contrast={1-0.12*k:.3f}:saturation={1-0.08*k:.3f}:brightness={0.01*k:.3f}",
-            f"gblur=sigma={0.50+1.00*k:.3f}",
-        ),
-        "deband": _chain(
-            f"gradfun=strength={0.50+0.80*k:.3f}",
-        ),
-    }
-    vf = vf_map.get(pkey, vf_map["cinematic"])
-
-    # 4) проверка поддержки фильтров
-    supp = {name: _ffmpeg_has_filter(name) for name in ["gblur", "boxblur", "vignette"]}
-
-    gblur_fallback_used = False
-    vignette_paramless_used = False
-    vignette_removed = False
-
-    # gblur → boxblur (или удалить)
-    if "gblur" in vf and not supp.get("gblur"):
-        if supp.get("boxblur"):
-            vf = re.sub(
-                r"gblur\s*=\s*sigma\s*=\s*([\d.]+)",
-                lambda m: f"boxblur={round(2*float(m.group(1))+0.5, 2)}:1",
-                vf,
-            )
-            gblur_fallback_used = True
-        else:
-            vf = re.sub(
-                r"(,)?gblur\s*=\s*[^,]+(,)?",
-                lambda m: "," if m.group(1) and m.group(2) else "",
-                vf,
-            ).strip(",")
-            gblur_fallback_used = True
-
-    # vignette → без параметров, либо удалить
-    if "vignette" in vf:
-        if supp.get("vignette"):
-            # Проверим: поддерживает ли ffmpeg параметр vignette без аргументов
-            vignette_paramless_used = True
-            # Если фильтр не проходит, можно попробовать убрать его
-            # (но оставим в цепочке как есть, если поддержка есть)
-        else:
-            # fallback — убираем vignette
-            vf = vf.replace(",vignette", "")
-            vignette_removed = True
-
-    # --- stage: encoding ---
-    update_job_status(
-        job_id, RUNNING, result={"stage": "encoding", "progress": 70, "vf": vf}
-    )
-
-    # 5) запуск ffmpeg с прогрессом
-    # Получим длительность исходника, чтобы нормировать прогресс
-    total_dur = None
-    try:
-        meta = _ffprobe_json(src)  # type: ignore[name-defined]
-        fmt = meta.get("format", {})
-        total_dur = float(fmt.get("duration") or 0) or None
-    except Exception:
-        total_dur = None  # не критично
-
-    out_path = OUT_DIR / _uuid_name("flt_vid_out", ".mp4")  # type: ignore[name-defined]
-    cmd = [
-        FFMPEG,
-        "-y",
-        "-i",
-        str(src),  # type: ignore[name-defined]
-        "-vf",
-        vf,
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "21",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-movflags",
-        "+faststart",
-        str(out_path),
-    ]
-
-    # Асинхронный запуск ffmpeg и чтение stderr для прогресса
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    last_pct = 70  # мы уже показали "encoding" 70% перед запуском
-    last_t = 0.0
-    time_re = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
-
-    while True:
-        if proc.stderr is None:
-            break
-        line = await proc.stderr.readline()
-        if not line:
-            break
-        s = line.decode("utf-8", errors="ignore").strip()
-
-        m = time_re.search(s)
-        if m:
-            h, mi, sec = int(m.group(1)), int(m.group(2)), float(m.group(3))
-            cur_sec = h * 3600 + mi * 60 + sec
-            if total_dur and total_dur > 0:
-                frac = min(1.0, max(0.0, cur_sec / total_dur))
-                pct = 70 + int(frac * 29)  # 70..99
-            else:
-                pct = min(99, last_pct + 1)
-
-            now = time.time()
-            if pct != last_pct and (now - last_t) >= 0.3:
-                update_job_status(
-                    job_id,
-                    RUNNING,
-                    result={"stage": "encoding", "progress": pct, "vf": vf},
-                )
-                last_pct = pct
-                last_t = now
-
-    rc = await proc.wait()
-    if rc != 0:
-        err_tail = ""
-        try:
-            if proc.stderr is not None:
-                rem = await proc.stderr.read()
-                err_tail = (rem or b"").decode("utf-8", errors="ignore")[-500:]
-        except Exception:
-            pass
-        update_job_status(job_id, ERROR, error=(err_tail or "ffmpeg failed")[-500:])
-        raise RuntimeError(f"ffmpeg failed: {err_tail}")
-
-    result = {
-        "ok": True,
-        "preset": pkey,
-        "intensity": k,
-        "vf": vf,
-        "gblur_fallback": gblur_fallback_used,
-        "vignette_paramless": vignette_paramless_used,
-        "vignette_removed": vignette_removed,
-        "output_url": _public_url(out_path),  # type: ignore[name-defined]
-    }
-
-    # --- stage: done ---
-    update_job_status(job_id, DONE, result=result)
-    return result
-
-
-@app.on_event("startup")
-async def _start_workers():
-    for _ in range(VIDEO_WORKERS):
-        task = asyncio.create_task(_worker_loop())
-        app.state.worker_tasks.append(task)
-
-
-@app.on_event("shutdown")
-async def _stop_workers():
-    for t in app.state.worker_tasks:
-        t.cancel()
-
-
-# ── CORS (если надо дёргать из фронта) ─────────────────────────────────
-try:
-    from fastapi.middleware.cors import CORSMiddleware
-
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-except Exception:
-    pass
-
-
-# ── helpers ────────────────────────────────────────────────────────────
-def _public_url(local_path: Path) -> str:
-    rel = local_path.relative_to(STATIC_DIR).as_posix()
-    return f"/static/{rel}"
-
-
-def _ext_from_url(url: str, default=".bin") -> str:
-    guess = os.path.splitext(url.split("?")[0])[1]
-    return guess if guess else default
-
-
-async def _download_to(url: str, dst_path: Path) -> Path:
-    """
-    Скачивает файл по URL в dst_path.
-    - follow_redirects=True — чтобы принимать 302 (picsum/fastly, и т.п.)
-    - Вежливый User-Agent — для Wikimedia/CDN
-    """
-    headers = {
-        "User-Agent": "ig-planner/1.0 (+https://ig-planner-backend.onrender.com)",
-        "Accept": "*/*",
-    }
-    async with httpx.AsyncClient(
-        timeout=120, headers=headers, follow_redirects=True
-    ) as client:
-        r = await client.get(url)
-        try:
-            r.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            status = e.response.status_code if e.response is not None else "?"
-            location = (
-                e.response.headers.get("Location") if e.response is not None else None
-            )
-            hint = f"\nRedirect location: {location}" if location else ""
-            raise RuntimeError(f"Download failed ({status}) {url}{hint}") from None
-        dst_path.write_bytes(r.content)
-    return dst_path
-
-
-# --- HTTP client with retries -------------------------------------------------
-DEFAULT_TIMEOUT = httpx.Timeout(connect=10, read=30, write=30, pool=30)
-
-
-class RetryClient(httpx.AsyncClient):
-    async def request(
-        self, method, url, *args, retries: int = 3, backoff: float = 0.5, **kwargs
-    ):
-        attempt = 0
-        while True:
-            try:
-                return await super().request(
-                    method,
-                    url,
-                    *args,
-                    timeout=kwargs.pop("timeout", DEFAULT_TIMEOUT),
-                    **kwargs,
-                )
-            except (
-                httpx.ConnectError,
-                httpx.ReadTimeout,
-                httpx.WriteError,
-                httpx.RemoteProtocolError,
-            ):
-                attempt += 1
-                if attempt > retries:
-                    raise
-                await asyncio.sleep(
-                    backoff * (2 ** (attempt - 1)) + random.uniform(0, 0.2)
-                )
-    async def get(self, url, *, retries: int = 3, backoff: float = 0.5, **kwargs):
-        return await self.request("GET", url, retries=retries, backoff=backoff, **kwargs)
-
-    async def post(self, url, *, retries: int = 3, backoff: float = 0.5, **kwargs):
-        return await self.request("POST", url, retries=retries, backoff=backoff, **kwargs)
-    async def delete(self, url, *, retries: int = 3, backoff: float = 0.5, **kwargs):
-        return await self.request("DELETE", url, retries=retries, backoff=backoff, **kwargs)
-
-    async def put(self, url, *, retries: int = 3, backoff: float = 0.5, **kwargs):
-        return await self.request("PUT", url, retries=retries, backoff=backoff, **kwargs)
-
-    async def patch(self, url, *, retries: int = 3, backoff: float = 0.5, **kwargs):
-        return await self.request("PATCH", url, retries=retries, backoff=backoff, **kwargs)
-
-def _uuid_name(prefix: str, ext: str) -> str:
-    ext = ext if ext.startswith(".") else f".{ext}"
-    return f"{prefix}_{uuid.uuid4().hex}{ext}"
-
-
-def _parse_aspect(aspect: Optional[str]) -> Optional[float]:
-    if not aspect:
-        return None
-    if ":" in aspect:
-        a, b = aspect.split(":")
-        try:
-            return float(a) / float(b)
-        except Exception:
-            return None
-    try:
-        return float(aspect)
-    except Exception:
-        return None
-
-
-def _ffprobe_json(path: Path) -> Dict[str, Any]:
-    cmd = [
-        FFPROBE,
-        "-v",
-        "error",
-        "-show_format",
-        "-show_streams",
-        "-of",
-        "json",
-        str(path),
-    ]
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    if p.returncode != 0:
-        raise RuntimeError(p.stderr.strip() or "ffprobe failed")
-    try:
-        return json.loads(p.stdout)
-    except Exception as e:
-        raise RuntimeError(f"ffprobe parse error: {e}")
-
-
-def _image_open(path: Path) -> Image.Image:
-    if not PIL_OK:
+def _image_open(path: Path):
+    if not PIL_OK or Image is None:
         raise RuntimeError("Pillow (PIL) is not installed. Run: pip install pillow")
     return Image.open(path).convert("RGBA")
 
 
-def _save_image_rgb(img: Image.Image, dst: Path, quality=90):
-    if not PIL_OK:
+def _save_image_rgb(img, dst: Path, quality: int = 90):
+    if not PIL_OK or Image is None:
         raise RuntimeError("Pillow (PIL) is not installed.")
     img_rgb = img.convert("RGB")
     img_rgb.save(dst, format="JPEG", quality=quality, optimize=True, progressive=True)
-
-
-def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _iso_to_utc(ts: str) -> datetime:
-    if ts.endswith("Z"):
-        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    return datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
-
-
-def _sleep_seconds_until(dt: datetime) -> float:
-    delta = (dt - _now_utc()).total_seconds()
-    return max(0.0, delta)
-
-
-# ---- Fonts: robust discovery & presets ---------------------------------
-# Можно указать папку со своими шрифтами через ENV (положить туда .ttf/.otf)
-CUSTOM_FONT_DIR = os.getenv("FONTS_DIR", "").strip()
-
-# Часто встречающиеся системные папки со шрифтами (linux/macos/windows)
-_SYS_FONT_DIRS = [
-    "/usr/share/fonts",
-    "/usr/local/share/fonts",
-    str(Path.home() / ".local/share/fonts"),
-    "/Library/Fonts",
-    "/System/Library/Fonts",
-    "C:\\Windows\\Fonts",
-]
-
-if CUSTOM_FONT_DIR:
-    _SYS_FONT_DIRS.insert(0, CUSTOM_FONT_DIR)
-
-# Базовые кандидаты на «дефолтные» семейства (по убыванию предпочтения)
-# Можно дополнять — главное, чтобы имя было частью файла (без расширения).
-_FONT_FALLBACKS = [
-    # популярные свободные
-    "Inter",
-    "DejaVuSans",
-    "NotoSans",
-    "Roboto",
-    "OpenSans",
-    # системные
-    "Arial",
-    "Helvetica",
-    "SegoeUI",
-    "SFNS",
-    "SanFrancisco",
-    "LiberationSans",
-]
-
-# Кеш найденных путей: {"inter:400": "/path/Inter-Regular.ttf", ...}
-_FONT_CACHE: Dict[str, str] = {}
-
-
-def _scan_fonts_once() -> Dict[str, str]:
-    """
-    Индексируем шрифты в указанных директориях (один раз за процесс).
-    Ключ — имя файла без расширения в нижнем регистре.
-    """
-    exts = {".ttf", ".otf", ".ttc"}
-    found: Dict[str, str] = {}
-    for root in _SYS_FONT_DIRS:
-        p = Path(root)
-        if not p.exists():
-            continue
-        for fp in p.rglob("*"):
-            try:
-                if fp.suffix.lower() in exts and fp.is_file():
-                    key = fp.stem.lower()  # например "inter-regular"
-                    found[key] = str(fp)
-            except Exception:
-                pass
-    return found
-
-
-# Индекс шрифтов (лениво заполняется при первом вызове)
-_FONT_INDEX: Optional[Dict[str, str]] = None
-
-
-def _font_index() -> Dict[str, str]:
-    global _FONT_INDEX
-    if _FONT_INDEX is None:
-        _FONT_INDEX = _scan_fonts_once()
-    return _FONT_INDEX
-
-
-def _resolve_font_path(preferred_names: List[str]) -> Optional[str]:
-    """
-    Пытается найти путь к шрифту по списку «человеческих» названий/семейств:
-    ["Inter", "Inter-Regular", "Arial"] и т.п.
-    Сопоставляет по вхождению имени в stem (без расширения), нечувствительно к регистру.
-    """
-    idx = _font_index()
-    names = [n.strip().lower() for n in preferred_names if n and n.strip()]
-    for name in names:
-        # сначала точное совпадение
-        if name in idx:
-            return idx[name]
-        # потом «по вхождению»
-        for stem, path in idx.items():
-            if name in stem:
-                return path
-    return None
-
-
-def _pick_font(size: int = 48, name: Optional[str] = None) -> "ImageFont.FreeTypeFont":
-    """
-    Универсальный загрузчик шрифта.
-    - name: желаемое семейство/файл (например, 'Inter', 'NotoSans', 'Arial', 'OpenSans-SemiBold').
-    - если не найден — пробуем _FONT_FALLBACKS, затем PIL default.
-    """
-    if not PIL_OK:
-        raise RuntimeError("Pillow not available")
-
-    # соберём кандидатов: указанный name -> fallbacks
-    candidates = []
-    if name:
-        candidates.append(name)
-    candidates.extend(_FONT_FALLBACKS)
-
-    # пробуем кеш и файловую систему
-    for cand in candidates:
-        cache_key = f"{cand}:{size}".lower()
-        if cache_key in _FONT_CACHE:
-            try:
-                return ImageFont.truetype(_FONT_CACHE[cache_key], size=size)
-            except Exception:
-                pass
-        path = _resolve_font_path([cand])
-        if path:
-            try:
-                font = ImageFont.truetype(path, size=size)
-                _FONT_CACHE[cache_key] = path
-                return font
-            except Exception:
-                continue
-
-    # крайний случай — встроенный шрифт PIL
-    return ImageFont.load_default()
-
 
 # ── LIVE state: берём всё из ENV и Graph API ────────────────────────────
 async def _resolve_page_and_ig_id(client: RetryClient) -> Dict[str, Any]:
@@ -829,13 +133,54 @@ async def _load_state() -> Dict[str, Any]:
             "ig_username": resolved["ig_username"],
         }
 
+# ── APP ────────────────────────────────────────────────────────────────
+app = FastAPI(title=settings.APP_NAME)
 
-# ── Healthcheck ──────────────────────────────────────────────────
-@app.get("/health")
-def health():
-    return {"ok": True, "ffmpeg": _has_ffmpeg(), "pillow": PIL_OK}
+# static
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
+# routers
+app.include_router(health_router)
+app.include_router(media_router)
 
+# ── JOB QUEUE (in-memory) ──────────────────────────────────────────────
+app.state.job_queue = asyncio.Queue()
+job_queue = app.state.job_queue
+
+async def _process_video_task(job_id: str) -> None:
+    """
+    TODO: сюда позже перенесём ffmpeg pipeline (из старого синхронного кода).
+    Сейчас — заглушка, чтобы воркеры не падали при старте проекта.
+    """
+    # Здесь НЕ делаем NotImplementedError, чтобы сервер стартовал
+    return
+
+async def _worker_loop(worker_id: int):
+    q = app.state.job_queue
+    while True:
+        job_id = await q.get()
+        try:
+            update_job_status(job_id, RUNNING)
+            await _process_video_task(job_id)
+            # если _process_video_task сам не выставил DONE — ставим DONE пустым результатом
+            j = get_job(job_id) or {}
+            if j.get("status") == RUNNING:
+                update_job_status(job_id, DONE, result={"note": "no-op stub"})
+        except Exception as e:
+            update_job_status(job_id, ERROR, error=str(e))
+        finally:
+            q.task_done()
+
+@app.on_event("startup")
+async def _startup_workers():
+    workers = int(getattr(settings, "VIDEO_WORKERS", 2) or 2)
+    app.state._workers = [asyncio.create_task(_worker_loop(i)) for i in range(workers)]
+
+@app.on_event("shutdown")
+async def _shutdown_workers():
+    for t in getattr(app.state, "_workers", []):
+        t.cancel()
+        
 # ── OAuth start ─────────────────────────────────────────────────────────
 @app.get("/oauth/start")
 def oauth_start():
@@ -918,10 +263,9 @@ async def auth_callback(
 #   Endpoint for Meta Review: /webhooks/instagram
 # ───────────────────────────────────────────────────────────────
 
-VERIFY_TOKEN = os.getenv("META_VERIFY_TOKEN", "my_verify_token").strip()
+# VERIFY_TOKEN already comes from meta_config (alias)
 
-
-@app.get("/webhooks/instagram")
+@app.get("/webhooks/instagram", response_class=PlainTextResponse)
 async def instagram_webhook_verify(
     hub_mode: str = Query(None, alias="hub.mode"),
     hub_challenge: str = Query(None, alias="hub.challenge"),
@@ -932,7 +276,7 @@ async def instagram_webhook_verify(
     We must return hub.challenge exactly.
     """
     if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
-        return int(hub_challenge or "0")
+        return hub_challenge or ""
     raise HTTPException(status_code=403, detail="Verification failed")
 
 
@@ -1185,8 +529,6 @@ async def ig_comments(media_id: str = Query(...), limit: int = 25):
         "paging": payload.get("paging", {}),
     }
 
-# ---- Mock for instagram_manage_messages (for Meta review) ----
-from datetime import datetime, timezone
 from uuid import uuid4
 
 MESSAGES = [
@@ -1391,7 +733,7 @@ async def ig_publish_video(
     cover_url: Optional[str] = Body(default=None, embed=True),
     share_to_feed: bool = Body(default=True, embed=True),
 ):
-    video_url = _cld_inject_transform(video_url, _CLOUD_REELS_TRANSFORM)
+    video_url = cld_inject_transform(video_url, CLOUD_REELS_TRANSFORM)
     st = await _load_state()
 
     async with RetryClient() as client:
@@ -1511,7 +853,7 @@ async def ig_publish_video_from_cloudinary(
     base_url = (
         f"https://res.cloudinary.com/{CLOUDINARY_CLOUD}/video/upload/{public_id}.mp4"
     )
-    video_url = _cld_inject_transform(base_url, _CLOUD_REELS_TRANSFORM)
+    video_url = cld_inject_transform(base_url, CLOUD_REELS_TRANSFORM)
     # делегируем в общий обработчик
     return await ig_publish_video(
         video_url=video_url,
@@ -2085,10 +1427,10 @@ async def flow_filter_publish_with_cover(
         }
 
     # 2) вытаскиваем кадр для обложки (ffmpeg)
-    if not _has_ffmpeg():
+    if not has_ffmpeg():
         return {"ok": False, "stage": "ffmpeg", "error": "ffmpeg not available"}
 
-    frame = OUT_DIR / _uuid_name("cover_frame", ".jpg")
+    frame = OUT_DIR / uuid_name("cover_frame", ".jpg")
     p = subprocess.run(
         [
             FFMPEG,
@@ -2115,7 +1457,7 @@ async def flow_filter_publish_with_cover(
         try:
             img = Image.open(frame).convert("RGBA")
             draw = ImageDraw.Draw(img)
-            font = _pick_font(size=64, name=title_font)
+            font = pick_font(size=64, name=title_font)
 
             wrapped = textwrap.fill(title, width=20)
             # оценка размеров текста
@@ -2144,11 +1486,11 @@ async def flow_filter_publish_with_cover(
                 xy, wrapped, font=font, fill=(255, 255, 255, 255), spacing=4
             )
 
-            cover_rgba = OUT_DIR / _uuid_name("cover", ".png")
+            cover_rgba = OUT_DIR / uuid_name("cover", ".png")
             img.save(cover_rgba)
 
             # JPEG для Cloudinary (экономичнее)
-            cover_jpg = OUT_DIR / _uuid_name("cover", ".jpg")
+            cover_jpg = OUT_DIR / uuid_name("cover", ".jpg")
             _save_image_rgb(Image.open(cover_rgba), cover_jpg, quality=92)
             cover_path = cover_jpg
         except Exception:
@@ -2207,742 +1549,6 @@ async def flow_filter_publish_with_cover(
     }
 
 
-# ======================================================================
-#                           MEDIA TOOLBOX
-# ======================================================================
-
-
-# 1) VALIDATE
-@app.post("/media/validate")
-async def media_validate(
-    url: str = Body(..., embed=True),
-    type: str = Body(..., embed=True, description="video|image"),
-    target: str = Body("REELS", embed=True),
-):
-    try:
-        ext = _ext_from_url(url, default=".bin")
-        tmp = UPLOAD_DIR / _uuid_name("dl", ext)
-        await _download_to(url, tmp)
-    except Exception as e:
-        return {"ok": False, "stage": "download", "error": str(e)}
-
-    info: Dict[str, Any] = {"path": str(tmp), "size": tmp.stat().st_size}
-    compatible, reasons = True, []
-
-    if type.lower() == "video":
-        if not _has_ffmpeg():
-            return {"ok": False, "error": "ffmpeg/ffprobe is not available on server."}
-        try:
-            meta = _ffprobe_json(tmp)
-            info["ffprobe"] = meta
-
-            vstreams = [
-                s for s in meta.get("streams", []) if s.get("codec_type") == "video"
-            ]
-            astreams = [
-                s for s in meta.get("streams", []) if s.get("codec_type") == "audio"
-            ]
-            fmt = meta.get("format", {})
-            duration = float(fmt.get("duration", 0) or 0)
-
-            if target.upper() == "REELS":
-                if duration <= 0 or duration > 90:
-                    compatible = False
-                    reasons.append("Duration must be 0–90s for safe Reels.")
-
-            if vstreams:
-                v = vstreams[0]
-                codec = v.get("codec_name")
-                width = int(v.get("width") or 0)
-                height = int(v.get("height") or 0)
-                pix_fmt = v.get("pix_fmt")
-
-                fps = 0.0
-                try:
-                    a, b = (v.get("r_frame_rate", "0/1") or "0/1").split("/")
-                    fps = float(a) / float(b)
-                except Exception:
-                    pass
-
-                if codec != "h264":
-                    compatible = False
-                    reasons.append(f"Video codec {codec} != h264")
-                if pix_fmt and pix_fmt != "yuv420p":
-                    reasons.append(f"pix_fmt {pix_fmt} != yuv420p")
-                if width > 1080 or height > 1920:
-                    reasons.append("Resolution will be downscaled (OK).")
-                if fps > 60:
-                    reasons.append("FPS >60 — лучше снизить до 30.")
-
-            if target.upper() == "REELS":
-                if not astreams:
-                    reasons.append("No audio stream — допустимо, но добавьте звук.")
-                else:
-                    ac = astreams[0].get("codec_name")
-                    if ac != "aac":
-                        reasons.append(f"Audio codec {ac} != aac (will be transcoded).")
-        except Exception as e:
-            return {"ok": False, "stage": "ffprobe", "error": str(e)}
-
-    else:
-        if not PIL_OK:
-            return {"ok": False, "error": "Pillow is not installed on server."}
-        try:
-            im_raw = Image.open(tmp)
-            w, h = im_raw.size
-            info["image"] = {"width": w, "height": h, "mode": im_raw.mode}
-            if target.upper() == "IMAGE" and max(w, h) > 2160:
-                reasons.append(
-                    "Очень крупное изображение — будет ужато до 1080 по длинной стороне."
-                )
-        except Exception as e:
-            return {"ok": False, "stage": "image_open", "error": str(e)}
-
-    return {
-        "ok": True,
-        "compatible": compatible,
-        "reasons": reasons,
-        "media_info": info,
-        "local_url": _public_url(tmp),
-    }
-
-
-# 2) TRANSCODE VIDEO
-@app.post("/media/transcode/video")
-async def media_transcode_video(
-    url: str = Body(..., embed=True),
-    target_aspect: Optional[str] = Body(default="9:16", embed=True),
-    max_duration_sec: int = Body(default=90, embed=True),
-    max_width: int = Body(default=1080, embed=True),
-    fps: int = Body(default=30, embed=True),
-    normalize_audio: bool = Body(default=True, embed=True),
-):
-    if not _has_ffmpeg():
-        return {"ok": False, "error": "ffmpeg not available."}
-    try:
-        src = UPLOAD_DIR / _uuid_name("src", _ext_from_url(url, ".mp4"))
-        await _download_to(url, src)
-    except Exception as e:
-        return {"ok": False, "stage": "download", "error": str(e)}
-
-    aspect = _parse_aspect(target_aspect) or (9 / 16)
-    out = OUT_DIR / _uuid_name("ready", ".mp4")
-
-    vf = [
-        f"scale='min({max_width},iw)':-2",
-        "setsar=1",
-        f"crop='min(iw,ih*{aspect}):ih'",
-        f"fps={fps}" if fps > 0 else None,
-        "format=yuv420p",
-    ]
-    vf = [x for x in vf if x]
-
-    af = ["loudnorm=I=-16:TP=-1.5:LRA=11"] if normalize_audio else []
-
-    cmd = [
-        FFMPEG,
-        "-y",
-        "-i",
-        str(src),
-        "-t",
-        str(max_duration_sec),
-        "-vf",
-        ",".join(vf),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "21",
-        "-pix_fmt",
-        "yuv420p",
-        "-movflags",
-        "+faststart",
-    ]
-    if af:
-        cmd += ["-af", ",".join(af)]
-    cmd += ["-c:a", "aac", "-b:a", "128k", str(out)]
-
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    if p.returncode != 0:
-        return {"ok": False, "stage": "ffmpeg", "stderr": p.stderr[-1000:]}
-    return {"ok": True, "output_url": _public_url(out)}
-
-
-# 3) RESIZE IMAGE
-@app.post("/media/resize/image")
-async def media_resize_image(
-    url: str = Body(..., embed=True),
-    target_aspect: str = Body("1:1", embed=True),
-    max_width: int = Body(1080, embed=True),
-    fit: str = Body("cover", embed=True, description="cover|contain"),
-    background: str = Body("black", embed=True),
-):
-    if not PIL_OK:
-        return {"ok": False, "error": "Pillow not installed."}
-    try:
-        src = UPLOAD_DIR / _uuid_name("img", _ext_from_url(url, ".jpg"))
-        await _download_to(url, src)
-        img = _image_open(src)
-    except Exception as e:
-        return {"ok": False, "stage": "download/open", "error": str(e)}
-
-    asp = _parse_aspect(target_aspect) or 1.0
-    tw = max_width
-    th = int(round(tw / asp))
-
-    if fit == "contain":
-        if isinstance(background, str) and background.lower() == "blur":
-            bg = (
-                img.copy()
-                .resize((tw, th), RESAMPLE_LANCZOS)
-                .filter(ImageFilter.GaussianBlur(radius=24))
-            )
-            canvas = bg.convert("RGBA")
-        else:
-            try:
-                canvas = Image.new("RGBA", (tw, th), background)
-            except Exception:
-                canvas = Image.new("RGBA", (tw, th), "black")
-
-        img_ratio = img.width / img.height
-        if img_ratio > asp:
-            nw = tw
-            nh = int(round(nw / img_ratio))
-        else:
-            nh = th
-            nw = int(round(nh * img_ratio))
-
-        img_res = img.resize((nw, nh), RESAMPLE_LANCZOS)
-        x = (tw - nw) // 2
-        y = (th - nh) // 2
-        canvas.paste(img_res, (x, y), img_res)
-        out = OUT_DIR / _uuid_name("img_resized", ".jpg")
-        _save_image_rgb(canvas, out, quality=90)
-        return {"ok": True, "output_url": _public_url(out)}
-
-    # cover
-    img_ratio = img.width / img.height
-    if img_ratio > asp:
-        new_w = int(round(img.height * asp))
-        left = (img.width - new_w) // 2
-        box = (left, 0, left + new_w, img.height)
-    else:
-        new_h = int(round(img.width / asp))
-        top = (img.height - new_h) // 2
-        box = (0, top, img.width, top + new_h)
-
-    img_c = img.crop(box).resize((tw, th), RESAMPLE_LANCZOS)
-    out = OUT_DIR / _uuid_name("img_cover", ".jpg")
-    _save_image_rgb(img_c, out, quality=92)
-    return {"ok": True, "output_url": _public_url(out)}
-
-
-# 4) REEL COVER (grab frame + optional text)
-@app.post("/media/reel-cover")
-async def media_reel_cover(
-    video_url: str = Body(..., embed=True),
-    at: float = Body(1.0, embed=True),
-    overlay: Optional[Dict[str, Any]] = Body(default=None, embed=True),
-):
-    if not _has_ffmpeg():
-        return {"ok": False, "error": "ffmpeg not available."}
-    try:
-        src = UPLOAD_DIR / _uuid_name("vid", _ext_from_url(video_url, ".mp4"))
-        await _download_to(video_url, src)
-    except Exception as e:
-        return {"ok": False, "stage": "download", "error": str(e)}
-
-    frame = OUT_DIR / _uuid_name("cover_frame", ".jpg")
-    p = subprocess.run(
-        [
-            FFMPEG,
-            "-y",
-            "-ss",
-            str(max(0.0, at)),
-            "-i",
-            str(src),
-            "-frames:v",
-            "1",
-            "-q:v",
-            "2",
-            str(frame),
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if p.returncode != 0:
-        return {"ok": False, "stage": "ffmpeg", "stderr": p.stderr[-1000:]}
-
-    if overlay and PIL_OK:
-        try:
-            img = Image.open(frame).convert("RGBA")
-            draw = ImageDraw.Draw(img)
-
-            text = (overlay or {}).get("text") or ""
-            pos = (overlay or {}).get("pos") or "bottom"
-            padding = int((overlay or {}).get("padding") or 32)
-            font_name = (overlay or {}).get(
-                "font"
-            )  # например "Inter", "NotoSans", "OpenSans-SemiBold"
-            font = _pick_font(size=48, name=font_name)
-
-            if text:
-                wrapped = textwrap.fill(text, width=20)
-                if hasattr(draw, "multiline_textbbox"):
-                    bbox = draw.multiline_textbbox(
-                        (0, 0), wrapped, font=font, spacing=4, align="left"
-                    )
-                    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-                else:
-                    try:
-                        bbox = draw.textbbox((0, 0), wrapped, font=font)
-                        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-                    except Exception:
-                        tw, th = draw.textsize(wrapped, font=font)
-
-                if pos == "bottom":
-                    xy = (padding, img.height - th - padding)
-                elif pos == "top":
-                    xy = (padding, padding)
-                else:
-                    xy = (padding, padding)
-
-                bg = Image.new(
-                    "RGBA", (tw + padding * 2, th + padding * 2), (0, 0, 0, 160)
-                )
-                img.paste(bg, (xy[0] - padding, xy[1] - padding), bg)
-                draw.multiline_text(
-                    xy, wrapped, font=font, fill=(255, 255, 255, 255), spacing=4
-                )
-
-            out = OUT_DIR / _uuid_name("cover", ".jpg")
-            _save_image_rgb(img, out, quality=92)
-            return {"ok": True, "cover_url": _public_url(out)}
-        except Exception as e:
-            return {
-                "ok": True,
-                "cover_url": _public_url(frame),
-                "note": f"PIL overlay skipped: {e}",
-            }
-
-    return {"ok": True, "cover_url": _public_url(frame)}
-
-
-# 5) WATERMARK (image or video)
-@app.post("/media/watermark")
-async def media_watermark(
-    url: str = Body(..., embed=True),
-    logo_url: str = Body(..., embed=True),
-    position: str = Body("br", embed=True),
-    opacity: float = Body(0.85, embed=True),
-    margin: int = Body(24, embed=True),
-    type: Optional[str] = Body(None, embed=True),
-):
-    ext = _ext_from_url(url, "")
-    is_video = type == "video" or ext.lower() in (".mp4", ".mov", ".m4v", ".webm")
-    try:
-        src = UPLOAD_DIR / _uuid_name("wm_src", ext or ".bin")
-        await _download_to(url, src)
-        logo = UPLOAD_DIR / _uuid_name("wm_logo", _ext_from_url(logo_url, ".png"))
-        await _download_to(logo_url, logo)
-    except Exception as e:
-        return {"ok": False, "stage": "download", "error": str(e)}
-
-    if not is_video:
-        if not PIL_OK:
-            return {"ok": False, "error": "Pillow not installed."}
-        try:
-            base = _image_open(src)
-            mark = Image.open(logo).convert("RGBA")
-
-            target_w = max(64, base.width // 6)
-            ratio = target_w / mark.width
-            mark = mark.resize((target_w, int(mark.height * ratio)), RESAMPLE_LANCZOS)
-
-            if opacity < 1.0:
-                alpha = mark.split()[-1].point(lambda p: int(p * opacity))
-                mark.putalpha(alpha)
-
-            if position in ("tr", "rt"):
-                x = base.width - mark.width - margin
-                y = margin
-            elif position in ("tl", "lt"):
-                x = margin
-                y = margin
-            elif position in ("bl", "lb"):
-                x = margin
-                y = base.height - mark.height - margin
-            else:
-                x = base.width - mark.width - margin
-                y = base.height - mark.height - margin
-
-            base.paste(mark, (x, y), mark)
-            out = OUT_DIR / _uuid_name("wm_img", ".jpg")
-            _save_image_rgb(base, out, quality=92)
-            return {"ok": True, "output_url": _public_url(out)}
-        except Exception as e:
-            return {"ok": False, "stage": "image_wm", "error": str(e)}
-    else:
-        if not _has_ffmpeg():
-            return {"ok": False, "error": "ffmpeg not available."}
-
-        pos_map = {
-            "tr": f"main_w-overlay_w-{margin}:{margin}",
-            "tl": f"{margin}:{margin}",
-            "bl": f"{margin}:main_h-overlay_h-{margin}",
-            "br": f"main_w-overlay_w-{margin}:main_h-overlay_h-{margin}",
-        }
-        expr = pos_map.get(position, pos_map["br"])
-
-        out = OUT_DIR / _uuid_name("wm_vid", ".mp4")
-        cmd = [
-            FFMPEG,
-            "-y",
-            "-i",
-            str(src),
-            "-i",
-            str(logo),
-            "-filter_complex",
-            f"[1]format=rgba,colorchannelmixer=aa={opacity}[lg];[0][lg]overlay={expr}",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "21",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
-            "-movflags",
-            "+faststart",
-            str(out),
-        ]
-        p = subprocess.run(cmd, capture_output=True, text=True)
-        if p.returncode != 0:
-            return {"ok": False, "stage": "ffmpeg", "stderr": p.stderr[-1000:]}
-
-        return {"ok": True, "output_url": _public_url(out)}
-
-
-# 6) FILTERS (image)
-@app.post("/media/filter/image")
-async def media_filter_image(
-    url: str = Body(..., embed=True),
-    preset: str = Body("cinematic", embed=True),
-    intensity: float = Body(0.7, embed=True),
-):
-    if not PIL_OK:
-        return {"ok": False, "error": "Pillow not installed."}
-    try:
-        src = UPLOAD_DIR / _uuid_name("flt_img", _ext_from_url(url, ".jpg"))
-        await _download_to(url, src)
-        img = Image.open(src).convert("RGB")
-    except Exception as e:
-        return {"ok": False, "stage": "download/open", "error": str(e)}
-
-    # clamp 0..1
-    k = max(0.0, min(1.0, float(intensity)))
-
-    try:
-        out_img = img
-
-        def _blend_color(base: Image.Image, rgb: tuple, alpha: float) -> Image.Image:
-            overlay = Image.new("RGB", base.size, rgb)
-            return Image.blend(base, overlay, max(0.0, min(1.0, alpha)))
-
-        def _vignette(base: Image.Image, strength: float) -> Image.Image:
-            w, h = base.size
-            pad = int(min(w, h) * (0.15 + 0.25 * strength))
-            m = Image.new("L", (w, h), 0)
-            draw = ImageDraw.Draw(m)
-            draw.ellipse((pad, pad, w - pad, h - pad), fill=255)
-            m = m.filter(
-                ImageFilter.GaussianBlur(
-                    radius=int(min(w, h) * (0.06 + 0.12 * strength))
-                )
-            )
-            dark = ImageEnhance.Brightness(base).enhance(1 - 0.25 * strength)
-            return Image.composite(dark, base, m)
-
-        p = (preset or "").lower().strip()
-
-        if p in ("b&w", "bw", "mono", "blackwhite"):
-            out_img = img.convert("L").convert("RGB")
-
-        elif p in ("warm", "warmth"):
-            r, g, b = img.split()
-            r = ImageEnhance.Brightness(r).enhance(1 + 0.15 * k)
-            b = ImageEnhance.Brightness(b).enhance(1 - 0.10 * k)
-            out_img = Image.merge("RGB", (r, g, b))
-            out_img = ImageEnhance.Color(out_img).enhance(1 + 0.10 * k)
-
-        elif p in ("cool", "cold"):
-            r, g, b = img.split()
-            b = ImageEnhance.Brightness(b).enhance(1 + 0.15 * k)
-            r = ImageEnhance.Brightness(r).enhance(1 - 0.10 * k)
-            out_img = Image.merge("RGB", (r, g, b))
-            out_img = ImageEnhance.Color(out_img).enhance(1 + 0.05 * k)
-
-        elif p in ("boost", "pop"):
-            out_img = ImageEnhance.Contrast(img).enhance(1 + 0.35 * k)
-            out_img = ImageEnhance.Color(out_img).enhance(1 + 0.35 * k)
-            out_img = ImageEnhance.Sharpness(out_img).enhance(1 + 0.25 * k)
-
-        elif p in ("cinematic", "cinema", "film"):
-            out_img = ImageEnhance.Contrast(img).enhance(1 + 0.15 * k)
-            out_img = ImageEnhance.Color(out_img).enhance(1 + 0.12 * k)
-            out_img = out_img.filter(ImageFilter.GaussianBlur(radius=0.5 * k))
-            out_img = ImageEnhance.Sharpness(out_img).enhance(1 + 0.2 * k)
-            out_img = _vignette(out_img, 0.5 * k)
-
-        elif p in ("teal_orange", "teal-orange", "tealorange"):
-            out_img = ImageEnhance.Contrast(img).enhance(1 + 0.10 * k)
-            out_img = ImageEnhance.Color(out_img).enhance(1 + 0.10 * k)
-            out_img = _blend_color(out_img, (0, 128, 128), 0.08 * k)
-            out_img = _blend_color(out_img, (255, 140, 0), 0.06 * k)
-            out_img = _vignette(out_img, 0.35 * k)
-
-        elif p in ("pastel", "soft"):
-            out_img = ImageEnhance.Contrast(img).enhance(1 - 0.15 * k)
-            out_img = ImageEnhance.Color(out_img).enhance(1 + 0.05 * k)
-            glow = out_img.filter(ImageFilter.GaussianBlur(radius=2 + 4 * k))
-            out_img = Image.blend(out_img, glow, 0.25 * k)
-
-        elif p in ("matte", "fade"):
-            out_img = ImageEnhance.Contrast(img).enhance(1 - 0.20 * k)
-            out_img = _blend_color(out_img, (20, 20, 20), 0.10 * k)
-            out_img = ImageEnhance.Color(out_img).enhance(1 - 0.05 * k)
-
-        elif p in ("hdr", "hdrish", "detail"):
-            out_img = ImageEnhance.Sharpness(img).enhance(1 + 0.6 * k)
-            out_img = ImageEnhance.Contrast(out_img).enhance(1 + 0.20 * k)
-            local = out_img.filter(ImageFilter.DETAIL)
-            out_img = Image.blend(out_img, local, 0.35 * k)
-
-        elif p in ("sepia",):
-            gray = img.convert("L")
-            out_img = Image.merge("RGB", (gray, gray, gray))
-            out_img = _blend_color(out_img, (112, 66, 20), 0.35 * k)
-            out_img = ImageEnhance.Contrast(out_img).enhance(1 + 0.05 * k)
-
-        elif p in ("vintage",):
-            out_img = ImageEnhance.Color(img).enhance(1 - 0.15 * k)
-            out_img = _blend_color(out_img, (230, 210, 180), 0.12 * k)
-            out_img = _vignette(out_img, 0.45 * k)
-
-        elif p in ("clarity", "structure"):
-            hi = ImageEnhance.Sharpness(img).enhance(1 + 0.8 * k)
-            lo = img.filter(ImageFilter.GaussianBlur(radius=1 + 2 * k))
-            out_img = Image.blend(hi, lo, 0.15 * k)
-            out_img = ImageEnhance.Contrast(out_img).enhance(1 + 0.10 * k)
-
-        else:
-            out_img = ImageEnhance.Contrast(img).enhance(1 + 0.12 * k)
-            out_img = ImageEnhance.Color(out_img).enhance(1 + 0.10 * k)
-            out_img = out_img.filter(ImageFilter.GaussianBlur(radius=0.3 * k))
-
-        out = OUT_DIR / _uuid_name("flt_img_out", ".jpg")
-        out_img.save(out, quality=92, optimize=True, progressive=True)
-        return {"ok": True, "preset": p, "intensity": k, "output_url": _public_url(out)}
-    except Exception as e:
-        return {"ok": False, "stage": "filter", "error": str(e)}
-
-
-# NEW: очередь — ставим задачу на фоновую обработку видео
-@app.post("/media/filter/video")
-async def enqueue_filter_video(body: dict = Body(...)):
-    """
-    Ставит задачу на фоновую обработку видео.
-    Вход: { "url": "...", "preset": "cinematic", "intensity": 0.7 }
-    Выход: { ok, job_id, status_url }
-    """
-    url = body.get("url")
-    preset = body.get("preset")
-    intensity = body.get("intensity", 0.7)
-
-    if not url:
-        raise HTTPException(status_code=400, detail="Field 'url' is required")
-    if preset is None:
-        raise HTTPException(status_code=400, detail="Field 'preset' is required")
-
-    payload = {"url": url, "preset": preset, "intensity": float(intensity)}
-
-    # Совместимость с разными версиями jobs.py
-    try:
-        # Вариант 1: create_job(kind=..., payload=...) -> str id
-        job_obj_or_id = create_job(kind="video_filter", payload=payload)
-    except TypeError:
-        try:
-            # Вариант 2: create_job(payload=..., preset=...) -> Job or id
-            job_obj_or_id = create_job(payload=payload, preset="video_filter")
-        except TypeError:
-            # Вариант 3: create_job(payload=...) -> Job or id
-            job_obj_or_id = create_job(payload=payload)
-
-    # извлекаем строковый id
-    job_id = getattr(job_obj_or_id, "id", job_obj_or_id)
-    if not isinstance(job_id, str):
-        job_id = str(job_id)
-
-    await job_queue.put(job_id)
-
-    return {
-        "ok": True,
-        "job_id": job_id,
-        "status_url": f"/media/filter/status?job_id={job_id}",
-    }
-
-
-@app.get("/media/filter/status")
-async def media_filter_status(job_id: str):
-    job = get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    return {
-        "ok": True,
-        "job_id": job_id,
-        "kind": job.get("kind"),
-        "status": job.get("status"),
-        "created_at": job.get("created_at"),
-        "updated_at": job.get("updated_at"),
-        "result": job.get("result"),
-        "error": job.get("error"),
-    }
-
-
-# 7) COMPOSITE COVER
-@app.post("/media/composite/cover")
-async def media_composite_cover(
-    frame_url: str = Body(..., embed=True),
-    title: str = Body("", embed=True),
-    bg: str = Body("blur", embed=True),
-    size: str = Body("1080x1920", embed=True),
-):
-    if not PIL_OK:
-        return {"ok": False, "error": "Pillow not installed."}
-
-    def _measure_multiline(
-        draw: ImageDraw.ImageDraw,
-        text: str,
-        font: ImageFont.ImageFont,
-        spacing: int = 4,
-        wrap_width: int = 20,
-    ):
-        lines = []
-        for para in text.split("\n"):
-            para = para.strip()
-            if para:
-                wrapped = textwrap.wrap(para, width=wrap_width) or [""]
-                lines.extend(wrapped)
-            else:
-                lines.append("")
-        if hasattr(draw, "multiline_textbbox"):
-            bbox = draw.multiline_textbbox(
-                (0, 0), "\n".join(lines), font=font, spacing=spacing, align="center"
-            )
-            return bbox[2] - bbox[0], bbox[3] - bbox[1], "\n".join(lines)
-        # fallback для старых PIL
-        max_w = 0
-        total_h = 0
-        for i, line in enumerate(lines):
-            try:
-                bbox = draw.textbbox((0, 0), line, font=font)
-                lw, lh = bbox[2] - bbox[0], bbox[3] - bbox[1]
-            except Exception:
-                lw, lh = draw.textsize(line, font=font)
-            max_w = max(max_w, lw)
-            total_h += lh + (spacing if i < len(lines) - 1 else 0)
-        return max_w, total_h, "\n".join(lines)
-
-    try:
-        w, h = [int(x) for x in size.lower().split("x")]
-    except Exception:
-        w, h = 1080, 1920
-
-    try:
-        src = UPLOAD_DIR / _uuid_name("frame", _ext_from_url(frame_url, ".jpg"))
-        await _download_to(frame_url, src)
-        img = Image.open(src).convert("RGB")
-    except Exception as e:
-        return {"ok": False, "stage": "download/open", "error": str(e)}
-
-    # фон
-    try:
-        if bg == "solid":
-            canvas = Image.new("RGB", (w, h), "#0b0b0b")
-        elif bg == "gradient":
-            grad = Image.new("RGB", (1, h))
-            top = (10, 10, 10)
-            bottom = (40, 6, 60)
-            for y in range(h):
-                t = y / max(1, h - 1)
-                c = tuple(int(top[i] * (1 - t) + bottom[i] * t) for i in range(3))
-                grad.putpixel((0, y), c)
-            canvas = grad.resize((w, h), RESAMPLE_LANCZOS)
-        else:
-            canvas = (
-                img.copy()
-                .resize((w, h), RESAMPLE_LANCZOS)
-                .filter(ImageFilter.GaussianBlur(radius=24))
-            )
-    except Exception as e:
-        return {"ok": False, "stage": "background", "error": str(e)}
-
-    # вставляем фрейм
-    try:
-        max_frame_h = int(h * 0.8)
-        ratio = img.width / img.height
-        frame_h = max_frame_h
-        frame_w = int(round(frame_h * ratio))
-        if frame_w > int(w * 0.9):
-            frame_w = int(w * 0.9)
-            frame_h = int(round(frame_w / ratio))
-        frame_res = img.resize((frame_w, frame_h), RESAMPLE_LANCZOS)
-        x = (w - frame_w) // 2
-        y = int(h * 0.1)
-        canvas.paste(frame_res, (x, y))
-    except Exception as e:
-        return {"ok": False, "stage": "paste_frame", "error": str(e)}
-
-    # заголовок
-    if title:
-        try:
-            rgba = canvas.convert("RGBA")
-            draw = ImageDraw.Draw(rgba)
-            font = _pick_font(size=64)
-            tw, th, wrapped = _measure_multiline(
-                draw, title, font, spacing=4, wrap_width=20
-            )
-            bx = (w - tw) // 2
-            by = y + frame_h + 24
-            pad = 24
-            rect = Image.new(
-                "RGBA", (max(1, tw) + pad * 2, max(1, th) + pad * 2), (0, 0, 0, 160)
-            )
-            rgba.paste(rect, (bx - pad, by - pad), rect)
-            draw.multiline_text(
-                (bx, by),
-                wrapped,
-                font=font,
-                fill=(255, 255, 255, 255),
-                spacing=4,
-                align="center",
-            )
-            canvas = rgba.convert("RGB")
-        except Exception:
-            pass
-
-    try:
-        out = OUT_DIR / _uuid_name("cover_comp", ".jpg")
-        canvas.save(out, quality=92, optimize=True, progressive=True)
-        return {"ok": True, "output_url": _public_url(out)}
-    except Exception as e:
-        return {"ok": False, "stage": "save", "error": str(e)}
-
-
 # 8) SCHEDULER (in-memory; dev)
 JOBS: Dict[str, Dict[str, Any]] = {}
 
@@ -2950,7 +1556,7 @@ JOBS: Dict[str, Dict[str, Any]] = {}
 async def _publish_job(
     job_id: str, ig_id: str, page_token: str, creation_id: str, run_at: datetime
 ):
-    wait = _sleep_seconds_until(run_at)
+    wait = sleep_seconds_until(run_at)
     await asyncio.sleep(wait)
     if JOBS.get(job_id, {}).get("status") == "canceled":
         return
@@ -2975,7 +1581,7 @@ async def ig_schedule(
     publish_at: str = Body(..., embed=True),  # ISO, e.g. 2025-09-08T12:00:00Z
 ):
     st = await _load_state()
-    run_at = _iso_to_utc(publish_at)
+    run_at = iso_to_utc(publish_at)
     job_id = uuid.uuid4().hex
     JOBS[job_id] = {
         "status": "scheduled",
@@ -3179,7 +1785,7 @@ def cleanup_tmp(hours: int = 12):
 
 @app.get("/util/fonts")
 def list_fonts(q: Optional[str] = None, limit: int = 100):
-    idx = _font_index()
+    idx = font_index()
     items = sorted(idx.items())
     if q:
         ql = q.lower()

@@ -1,0 +1,45 @@
+from typing import Optional
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    # App
+    APP_NAME: str = "IG Planner Backend"
+    ENV: str = Field(default="prod", description="dev | prod")
+    DEBUG: bool = False
+
+    # Server
+    HOST: str = "0.0.0.0"
+    PORT: int = 8000
+
+    # Meta / Instagram (оставляем как у тебя; потом синхронизируем с main.py)
+    IG_APP_ID: Optional[str] = None
+    IG_APP_SECRET: Optional[str] = None
+    IG_ACCESS_TOKEN: Optional[str] = None
+    IG_VERIFY_TOKEN: Optional[str] = None
+
+    # Cloudinary (пока оставляем)
+    CLOUDINARY_CLOUD: Optional[str] = None
+    CLOUDINARY_API_KEY: Optional[str] = None
+    CLOUDINARY_API_SECRET: Optional[str] = None
+    CLOUDINARY_UNSIGNED_PRESET: Optional[str] = None
+
+    # Media / FFmpeg
+    FFMPEG_BIN: str = "ffmpeg"
+    FFPROBE_BIN: str = "ffprobe"
+    MEDIA_TMP_DIR: str = "/tmp/ig_planner"
+
+    # Jobs
+    VIDEO_WORKERS: int = 2
+    JOB_TTL_SECONDS: int = 60 * 60  # 1 час
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+
+settings = Settings()
