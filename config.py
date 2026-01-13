@@ -14,13 +14,13 @@ class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
     PORT: int = 8000
 
-    # Meta / Instagram (оставляем как у тебя; потом синхронизируем с main.py)
+    # Meta / Instagram
     IG_APP_ID: Optional[str] = None
     IG_APP_SECRET: Optional[str] = None
     IG_ACCESS_TOKEN: Optional[str] = None
     IG_VERIFY_TOKEN: Optional[str] = None
 
-    # Cloudinary (пока оставляем)
+    # Cloudinary
     CLOUDINARY_CLOUD: Optional[str] = None
     CLOUDINARY_API_KEY: Optional[str] = None
     CLOUDINARY_API_SECRET: Optional[str] = None
@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     # Jobs
     VIDEO_WORKERS: int = 2
     JOB_TTL_SECONDS: int = 60 * 60  # 1 час
+
+    # Redis
+    REDIS_URL: Optional[str] = None
+    REDIS_PREFIX: str = "jobs"
+    REDIS_QUEUE: str = "jobs:queue"
 
     model_config = SettingsConfigDict(
         env_file=".env",

@@ -1,269 +1,176 @@
 import os
-import secrets
 import json
-import time
 import asyncio
 import uuid
-import re
 import subprocess
-import textwrap
-import shutil
-from jobs import create_job, get_job, update_job_status, RUNNING, DONE, ERROR
-from typing import Optional, List, Dict, Any
-from urllib.parse import urlencode
 from pathlib import Path
-import random
+from typing import Optional, List, Dict, Any
+from datetime import datetime, timezone
 
 import httpx
 from fastapi import FastAPI, HTTPException, Body, Query, Response
-from fastapi.responses import RedirectResponse, PlainTextResponse, Response
+from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
-from datetime import datetime, timezone
+
 from config import settings
+from services.ig_state import load_state
+
 from health_router import router as health_router
 from media_router import router as media_router
-from http_client import RetryClient, DEFAULT_TIMEOUT
-from ffmpeg_utils import FFMPEG, FFPROBE, has_ffmpeg, ffmpeg_has_filter, ffprobe_json
-from fonts_utils import PIL_OK, pick_font, font_index
-from file_utils import uuid_name, ext_from_url, public_url, download_to
-from time_utils import now_utc, iso_to_utc, sleep_seconds_until
-from cloudinary_utils import (
-    cld_inject_transform,
-    CLOUD_REELS_TRANSFORM,
-    cloudinary_unsigned_upload_file,
-    cloudinary_unsigned_upload_bytes,
-)
-from meta_config import *
+from routers.auth import router as auth_router
+from routers.util import router as util_router
+from routers.flow import router as flow_router
+from ffmpeg_utils import FFMPEG, has_ffmpeg
+from file_utils import download_to, ext_from_url, uuid_name, public_url
+from jobs import brpop_job, get_job, update_job_status, RUNNING, DONE, ERROR, close_redis
 from paths import STATIC_DIR, UPLOAD_DIR, OUT_DIR, ensure_dirs
+
+
+from http_client import RetryClient
+from time_utils import iso_to_utc, sleep_seconds_until
+
+from cloudinary_utils import cld_inject_transform, CLOUD_REELS_TRANSFORM
+
+from meta_config import (
+    GRAPH_BASE,
+    ME_URL,
+    VERIFY_TOKEN,
+    IG_LONG_TOKEN,
+    CLOUDINARY_CLOUD,
+)
+
+
 ensure_dirs()
 
-# Pillow modules (не трогаем PIL_OK — он приходит из fonts_utils)
-try:
-    from PIL import Image, ImageDraw, ImageFilter, ImageEnhance
-except Exception:
-    Image = None  # type: ignore
-    ImageDraw = None  # type: ignore
-    ImageFilter = None  # type: ignore
-    ImageEnhance = None  # type: ignore
-
-# Pillow 10+ resampling constant (если Image доступен)
-try:
-    RESAMPLE_LANCZOS = Image.Resampling.LANCZOS  # type: ignore[attr-defined]
-except Exception:
-    RESAMPLE_LANCZOS = getattr(Image, "LANCZOS", getattr(Image, "BICUBIC", 3)) if Image else None
-    
-# ── ENV ────────────────────────────────────────────────────────────────
-# Источник правды: meta_config.py + settings (config.py)
-# load_dotenv() здесь не нужен.
-
-# Эти имена уже импортированы из meta_config через `from meta_config import *`
-# Оставляем их как есть, чтобы старый код ниже работал без переписывания.
-
-# Для /oauth/start
-STATE_STORE = set()
-
-def _image_open(path: Path):
-    if not PIL_OK or Image is None:
-        raise RuntimeError("Pillow (PIL) is not installed. Run: pip install pillow")
-    return Image.open(path).convert("RGBA")
-
-
-def _save_image_rgb(img, dst: Path, quality: int = 90):
-    if not PIL_OK or Image is None:
-        raise RuntimeError("Pillow (PIL) is not installed.")
-    img_rgb = img.convert("RGB")
-    img_rgb.save(dst, format="JPEG", quality=quality, optimize=True, progressive=True)
-
-# ── LIVE state: берём всё из ENV и Graph API ────────────────────────────
-async def _resolve_page_and_ig_id(client: RetryClient) -> Dict[str, Any]:
-    """
-    Возвращает page_id, ig_id (instagram_business_account.id) и ig_username.
-    1) Если PAGE_ID задан в ENV — используем его.
-    2) Иначе берём первую доступную страницу из /me/accounts.
-    """
-    if not IG_LONG_TOKEN:
-        raise HTTPException(500, "IG_ACCESS_TOKEN is not set in env.")
-
-    # 1) page_id
-    page_id = PAGE_ID_ENV
-    if not page_id:
-        r = await client.get(
-            f"{ME_URL}/accounts",
-            params={"access_token": IG_LONG_TOKEN, "fields": "id,name,access_token"},
-            retries=4,
-        )
-        r.raise_for_status()
-        pages = r.json().get("data") or []
-        if not pages:
-            raise HTTPException(400, "No Pages available for this token.")
-        page_id = pages[0]["id"]
-
-    # 2) ig_id + username
-    r2 = await client.get(
-        f"{GRAPH_BASE}/{page_id}",
-        params={
-            "fields": "instagram_business_account{id,username}",
-            "access_token": IG_LONG_TOKEN,
-        },
-        retries=4,
-    )
-    r2.raise_for_status()
-    ig = r2.json().get("instagram_business_account") or {}
-    ig_id = ig.get("id")
-    ig_username = ig.get("username")
-    if not ig_id:
-        raise HTTPException(400, "This Page has no instagram_business_account linked.")
-
-    return {"page_id": page_id, "ig_id": ig_id, "ig_username": ig_username}
-
-
-async def _load_state() -> Dict[str, Any]:
-    """
-    Итоговое состояние для публикации:
-    - page_access_token = IG_ACCESS_TOKEN (длинный)
-    - ig_id из Graph API
-    """
-    async with RetryClient() as client:
-        resolved = await _resolve_page_and_ig_id(client)
-        return {
-            "ig_id": resolved["ig_id"],
-            "page_token": IG_LONG_TOKEN,  # используем как page_access_token
-            "user_token": IG_LONG_TOKEN,  # и как user_long_lived
-            "page_id": resolved["page_id"],
-            "ig_username": resolved["ig_username"],
-        }
-
-# ── APP ────────────────────────────────────────────────────────────────
 app = FastAPI(title=settings.APP_NAME)
 
-# static
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-# routers
 app.include_router(health_router)
 app.include_router(media_router)
+app.include_router(auth_router)
+app.include_router(util_router)
+app.include_router(flow_router)
 
-# ── JOB QUEUE (in-memory) ──────────────────────────────────────────────
-app.state.job_queue = asyncio.Queue()
-job_queue = app.state.job_queue
+# ── JOB WORKERS (Redis-backed queue is handled inside jobs.py) ──────────
+VIDEO_WORKERS = int(os.getenv("VIDEO_WORKERS", "1"))
 
 async def _process_video_task(job_id: str) -> None:
-    """
-    TODO: сюда позже перенесём ffmpeg pipeline (из старого синхронного кода).
-    Сейчас — заглушка, чтобы воркеры не падали при старте проекта.
-    """
-    # Здесь НЕ делаем NotImplementedError, чтобы сервер стартовал
-    return
+    job = await get_job(job_id)
+    if not job:
+        await update_job_status(job_id, ERROR, error="Job not found")
+        return
 
-async def _worker_loop(worker_id: int):
-    q = app.state.job_queue
+    payload = job.get("payload") or {}
+    url = (payload.get("url") or "").strip()
+    preset = (payload.get("preset") or "cinematic").strip().lower()
+    try:
+        intensity = float(payload.get("intensity", 0.7))
+    except Exception:
+        intensity = 0.7
+    intensity = max(0.0, min(1.0, intensity))
+
+    if not url:
+        await update_job_status(job_id, ERROR, error="payload.url is required")
+        return
+
+    if not has_ffmpeg():
+        await update_job_status(job_id, ERROR, error="ffmpeg not available on server")
+        return
+
+    # 1) Resolve input file (local /static/... or download)
+    try:
+        if url.startswith("/static/"):
+            rel = url[len("/static/"):]
+            src = STATIC_DIR / rel
+            if not src.exists():
+                await update_job_status(job_id, ERROR, error=f"Local file not found: {src}")
+                return
+        else:
+            src = UPLOAD_DIR / uuid_name("src", ext_from_url(url, ".mp4"))
+            await download_to(url, src)
+    except Exception as e:
+        await update_job_status(job_id, ERROR, error=f"download/open failed: {e}")
+        return
+
+    # 2) Build very small filter set
+    k = intensity
+    if preset in ("bw", "b&w", "mono", "blackwhite", "black_white"):
+        vf = "hue=s=0"
+    else:
+        # cinematic-ish: slight contrast/sat + tiny gamma tweak
+        # keep it simple and stable
+        contrast = 1.0 + 0.20 * k
+        saturation = 1.0 + 0.15 * k
+        gamma = 1.0 - 0.05 * k
+        vf = f"eq=contrast={contrast}:saturation={saturation}:gamma={gamma}"
+
+    out = OUT_DIR / uuid_name("flt_vid_out", ".mp4")
+
+    cmd = [
+        FFMPEG, "-y",
+        "-i", str(src),
+        "-vf", vf,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "21",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        str(out),
+    ]
+
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        err = (p.stderr or "")[-1200:]
+        await update_job_status(job_id, ERROR, error=f"ffmpeg failed: {err}")
+        return
+
+    await update_job_status(
+        job_id,
+        DONE,
+        result={"output_url": public_url(out, STATIC_DIR)},
+    )
+
+async def _worker_loop(worker_idx: int):
     while True:
-        job_id = await q.get()
+        job_id = await brpop_job(timeout=5)
+        if not job_id:
+            continue
+
+        job = await get_job(job_id)
+        if not job:
+            continue
+
         try:
-            update_job_status(job_id, RUNNING)
-            await _process_video_task(job_id)
-            # если _process_video_task сам не выставил DONE — ставим DONE пустым результатом
-            j = get_job(job_id) or {}
-            if j.get("status") == RUNNING:
-                update_job_status(job_id, DONE, result={"note": "no-op stub"})
+            await update_job_status(job_id, RUNNING)
+
+            if (job.get("kind") or "").lower() == "video_filter":
+                await _process_video_task(job_id)
+            else:
+                await update_job_status(
+                    job_id, ERROR, error=f"Unknown job kind: {job.get('kind')}"
+                )
+
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            update_job_status(job_id, ERROR, error=str(e))
-        finally:
-            q.task_done()
+            await update_job_status(job_id, ERROR, error=str(e))
 
 @app.on_event("startup")
-async def _startup_workers():
-    workers = int(getattr(settings, "VIDEO_WORKERS", 2) or 2)
-    app.state._workers = [asyncio.create_task(_worker_loop(i)) for i in range(workers)]
+async def _startup():
+    app.state._workers = [
+        asyncio.create_task(_worker_loop(i))
+        for i in range(max(1, VIDEO_WORKERS))
+    ]
 
 @app.on_event("shutdown")
-async def _shutdown_workers():
+async def _shutdown():
     for t in getattr(app.state, "_workers", []):
         t.cancel()
-        
-# ── OAuth start ─────────────────────────────────────────────────────────
-@app.get("/oauth/start")
-def oauth_start():
-    if not APP_ID or not APP_SECRET or not REDIRECT_URI:
-        raise HTTPException(
-            500, "META_APP_ID / META_APP_SECRET / META_REDIRECT_URI are not set in env."
-        )
-    state = secrets.token_urlsafe(16)
-    STATE_STORE.add(state)
-    params = {
-        "client_id": APP_ID,
-        "redirect_uri": REDIRECT_URI,
-        "state": state,
-        "scope": SCOPES,
-    }
-    return RedirectResponse(f"{META_AUTH}?{urlencode(params)}")
-
-
-# ── OAuth callback (без записи в файл; просто отдаём токены) ────────────
-@app.get("/oauth/callback")
-async def oauth_callback(
-    code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None
-):
-    if error:
-        raise HTTPException(400, f"OAuth error: {error}")
-    if not code or not state or state not in STATE_STORE:
-        raise HTTPException(400, "Invalid state or code")
-    STATE_STORE.discard(state)
-
-    async with RetryClient() as client:  # 1) code -> short-lived user token
-        r = await client.get(
-            TOKEN_URL,
-            params={
-                "client_id": APP_ID,
-                "client_secret": APP_SECRET,
-                "redirect_uri": REDIRECT_URI,
-                "code": code,
-            },
-            retries=4,
-        )
-        r.raise_for_status()
-        short = r.json()
-
-        # 2) short-lived -> long-lived user token
-        r2 = await client.get(
-            TOKEN_URL,
-            params={
-                "grant_type": "fb_exchange_token",
-                "client_id": APP_ID,
-                "client_secret": APP_SECRET,
-                "fb_exchange_token": short["access_token"],
-            },
-        )
-        r2.raise_for_status()
-        long_user = r2.json()
-        user_token = long_user["access_token"]
-
-        # 3) вернём пользователю (без сохранения на диск)
-        return {
-            "ok": True,
-            "short_lived": short,
-            "long_lived": {
-                "access_token": user_token,
-                "token_type": long_user.get("token_type"),
-                "expires_in": long_user.get("expires_in"),
-            },
-            "note": "Сохраните IG_ACCESS_TOKEN в переменных окружения сервера.",
-        }
-
-
-# рядом с /oauth/callback
-@app.get("/auth/callback")
-async def auth_callback(
-    code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None
-):
-    return await oauth_callback(code=code, state=state, error=error)
-
-# ───────────────────────────────────────────────────────────────
-#   INSTAGRAM WEBHOOK (VERIFY + EVENTS)
-#   Endpoint for Meta Review: /webhooks/instagram
-# ───────────────────────────────────────────────────────────────
-
-# VERIFY_TOKEN already comes from meta_config (alias)
+    await asyncio.gather(*getattr(app.state, "_workers", []), return_exceptions=True)
+    await close_redis()
 
 @app.get("/webhooks/instagram", response_class=PlainTextResponse)
 async def instagram_webhook_verify(
@@ -291,89 +198,6 @@ async def instagram_webhook_events(payload: dict):
 
     # For safety: ALWAYS return 200
     return {"status": "received", "ok": True}
-
-# ── Token tools: refresh & info ────────────────────────────────────────
-@app.get("/auth/token-info")
-async def auth_token_info():
-    """
-    Диагностика токена: /debug_token. Помогает понять срок действия и скоупы.
-    """
-    if not IG_LONG_TOKEN:
-        raise HTTPException(400, "IG_ACCESS_TOKEN is not set in env.")
-    if not APP_ID or not APP_SECRET:
-        raise HTTPException(500, "META_APP_ID / META_APP_SECRET are not set.")
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(
-            f"{GRAPH_BASE}/debug_token",
-            params={
-                "input_token": IG_LONG_TOKEN,
-                "access_token": f"{APP_ID}|{APP_SECRET}",
-            },
-        )
-        r.raise_for_status()
-        return {"ok": True, "data": r.json().get("data", {})}
-
-
-@app.post("/auth/refresh-token")
-async def auth_refresh_token(current_token: Optional[str] = Body(None, embed=True)):
-    """
-    Обновляет long-lived user token ещё на ~60 дней.
-    Если current_token не передан — берём IG_ACCESS_TOKEN из ENV.
-    Возвращает НОВЫЙ токен — его нужно руками сохранить в Render env.
-    """
-    token_to_refresh = (current_token or IG_LONG_TOKEN or "").strip()
-    if not token_to_refresh:
-        raise HTTPException(
-            400,
-            "No token to refresh. Provide current_token or set IG_ACCESS_TOKEN in env.",
-        )
-    if not APP_ID or not APP_SECRET:
-        raise HTTPException(500, "META_APP_ID / META_APP_SECRET are not set.")
-
-    async with RetryClient() as client:
-        r = await client.get(
-            TOKEN_URL,
-            params={
-                "grant_type": "fb_exchange_token",
-                "client_id": APP_ID,
-                "client_secret": APP_SECRET,
-                "fb_exchange_token": token_to_refresh,
-            },
-            retries=4,
-        )
-        try:
-            r.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            # отдадим подробности от Graph
-            try:
-                err = e.response.json()
-            except Exception:
-                err = {"error": {"message": e.response.text if e.response else str(e)}}
-            raise HTTPException(e.response.status_code if e.response else 500, err)
-
-        data = r.json()
-        new_token = data.get("access_token")
-        return {
-            "ok": True,
-            "new_access_token": new_token,
-            "token_type": data.get("token_type"),
-            "expires_in": data.get("expires_in"),
-            "note": "Сохрани new_access_token в Render → Environment как IG_ACCESS_TOKEN и перезапусти сервис.",
-        }
-
-
-# ── Who am I (IG) ───────────────────────────────────────────────────────
-@app.get("/me/instagram")
-async def me_instagram():
-    st = await _load_state()
-    return {
-        "ok": True,
-        "page_id": st["page_id"],
-        "instagram_business_account": {
-            "id": st["ig_id"],
-            "username": st["ig_username"],
-        },
-    }
 
 
 # ── Pages diagnostics ───────────────────────────────────────────────────
@@ -446,34 +270,10 @@ async def me_pages():
 
     return {"ok": True, "pages": out}
 
-
-# ── Debug scopes ────────────────────────────────────────────────────────
-@app.get("/debug/scopes")
-async def debug_scopes():
-    if not IG_LONG_TOKEN:
-        raise HTTPException(400, "IG_ACCESS_TOKEN not set")
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(
-            f"{GRAPH_BASE}/debug_token",
-            params={
-                "input_token": IG_LONG_TOKEN,
-                "access_token": f"{APP_ID}|{APP_SECRET}",
-            },
-        )
-        r.raise_for_status()
-        info = r.json().get("data", {})
-    return {
-        "ok": True,
-        "is_valid": info.get("is_valid"),
-        "scopes": info.get("scopes", []),
-        "type": info.get("type"),
-    }
-
-
 # ── IG: latest media ────────────────────────────────────────────────────
 @app.get("/ig/media")
 async def ig_media(limit: int = 12, after: Optional[str] = None):
-    st = await _load_state()
+    st = await load_state()
     ig_id, page_token = st["ig_id"], st["page_token"]
 
     params = {
@@ -510,7 +310,7 @@ async def ig_media(limit: int = 12, after: Optional[str] = None):
 # ── IG: COMMENTS (list + create/reply/moderation) ───────────────────────
 @app.get("/ig/comments")
 async def ig_comments(media_id: str = Query(...), limit: int = 25):
-    st = await _load_state()
+    st = await load_state()
     async with RetryClient() as client:
         r = await client.get(
             f"{GRAPH_BASE}/{media_id}/comments",
@@ -583,7 +383,7 @@ async def ig_comment(
 ):
     if not media_id and not reply_to_comment_id:
         raise HTTPException(400, "Provide media_id OR reply_to_comment_id")
-    st = await _load_state()
+    st = await load_state()
     async with RetryClient() as client:
         if reply_to_comment_id:
             r = await client.post(
@@ -605,7 +405,7 @@ async def ig_comment(
 async def ig_comment_hide(
     comment_id: str = Body(..., embed=True), hide: bool = Body(default=True, embed=True)
 ):
-    st = await _load_state()
+    st = await load_state()
     async with RetryClient() as client:
         try:
             r = await client.post(
@@ -628,7 +428,7 @@ async def ig_comment_hide(
 
 @app.post("/ig/comments/delete")
 async def ig_comment_delete(comment_id: str = Body(..., embed=True)):
-    st = await _load_state()
+    st = await load_state()
     async with RetryClient() as client:
         r = await client.delete(
             f"{GRAPH_BASE}/{comment_id}",
@@ -652,7 +452,7 @@ async def ig_comments_reply_many(
     message: str = Body(..., embed=True),
     delay_ms: int = Body(default=600, embed=True),
 ):
-    st = await _load_state()
+    st = await load_state()
     results = []
     async with RetryClient() as client:
         for cid in comment_ids:
@@ -683,7 +483,7 @@ async def ig_publish_image(
     image_url: str = Body(..., embed=True),
     caption: Optional[str] = Body(default=None, embed=True),
 ):
-    st = await _load_state()
+    st = await load_state()
     async with RetryClient() as client:
         try:
             payload = {"image_url": image_url, "access_token": st["page_token"]}
@@ -734,7 +534,7 @@ async def ig_publish_video(
     share_to_feed: bool = Body(default=True, embed=True),
 ):
     video_url = cld_inject_transform(video_url, CLOUD_REELS_TRANSFORM)
-    st = await _load_state()
+    st = await load_state()
 
     async with RetryClient() as client:
         payload = {
@@ -925,7 +725,7 @@ async def ig_media_insights(
         "", description="Comma-separated metrics; if empty — auto by media type"
     ),
 ):
-    st = await _load_state()
+    st = await load_state()
     async with RetryClient() as client:
         # media_type
         try:
@@ -1007,7 +807,7 @@ async def ig_account_insights(
     Возвращает аккаунт-инсайты и НИКОГДА не роняет 500 из-за 400 от Graph.
     Если Graph вернул 400/403 и т.п. — отдаём {ok:false, ...} с подробностями.
     """
-    st = await _load_state()
+    st = await load_state()
     req_metrics = [m.strip() for m in metrics.split(",") if m.strip()]
 
     bad = [m for m in req_metrics if m not in ACCOUNT_INSIGHT_ALLOWED]
@@ -1057,56 +857,12 @@ async def ig_account_insights(
                 "hint": "Попробуй другой period (week/days_28) или метрику. На свежих аккаунтах day часто пустой.",
             }
 
-
-@app.post("/util/cloudinary/upload")
-async def cloudinary_upload(
-    file_url: str = Body(..., embed=True),
-    resource_type: str = Body("auto", embed=True),
-    folder: Optional[str] = Body(None, embed=True),
-    public_id: Optional[str] = Body(None, embed=True),
-):
-    if not CLOUDINARY_CLOUD or not CLOUDINARY_UNSIGNED_PRESET:
-        raise HTTPException(
-            400,
-            "Cloudinary env missing: set CLOUDINARY_CLOUD and CLOUDINARY_UNSIGNED_PRESET",
-        )
-    form = {"file": file_url, "upload_preset": CLOUDINARY_UNSIGNED_PRESET}
-    if folder:
-        form["folder"] = folder
-    if public_id:
-        form["public_id"] = public_id
-    endpoint = (
-        f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD}/{resource_type}/upload"
-    )
-    try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            r = await client.post(endpoint, data=form)
-            r.raise_for_status()
-            payload = r.json()
-    except httpx.HTTPStatusError as e:
-        try:
-            err = e.response.json()
-        except Exception:
-            err = {"status_code": e.response.status_code, "text": e.response.text[:500]}
-        return {"ok": False, "stage": "cloudinary", "error": err}
-    return {
-        "ok": True,
-        "resource_type": resource_type,
-        "secure_url": payload.get("secure_url"),
-        "public_id": payload.get("public_id"),
-        "format": payload.get("format"),
-        "width": payload.get("width"),
-        "height": payload.get("height"),
-        "duration": payload.get("duration"),
-    }
-
-
 @app.post("/ig/comment/after_publish")
 async def ig_comment_after_publish(
     media_id: str = Body(..., embed=True),
     message: str = Body(..., embed=True),
 ):
-    st = await _load_state()
+    st = await load_state()
     async with RetryClient() as client:
         r = await client.post(
             f"{GRAPH_BASE}/{media_id}/comments",
@@ -1122,431 +878,6 @@ async def ig_comment_after_publish(
                 "error": e.response.json(),
             }
         return {"ok": True, "result": r.json()}
-
-
-# === FLOW: filter → (upload to Cloudinary) → publish to IG =============
-
-
-async def _cloudinary_unsigned_upload_file(
-    path: Path,
-    *,
-    resource_type: str = "video",
-    folder: Optional[str] = None,
-    public_id: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Загрузка локального файла в Cloudinary (unsigned).
-    Требуются ENV: CLOUDINARY_CLOUD и CLOUDINARY_UNSIGNED_PRESET.
-    """
-    if not CLOUDINARY_CLOUD or not CLOUDINARY_UNSIGNED_PRESET:
-        raise HTTPException(
-            400,
-            "Cloudinary not configured: set CLOUDINARY_CLOUD and CLOUDINARY_UNSIGNED_PRESET",
-        )
-
-    endpoint = (
-        f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD}/{resource_type}/upload"
-    )
-    data = {"upload_preset": CLOUDINARY_UNSIGNED_PRESET}
-    if folder:
-        data["folder"] = folder
-    if public_id:
-        data["public_id"] = public_id
-
-    # определим mime
-    mime = "video/mp4" if resource_type == "video" else "image/jpeg"
-    files = {"file": (path.name, path.read_bytes(), mime)}
-
-    async with httpx.AsyncClient(timeout=300) as client:
-        r = await client.post(endpoint, data=data, files=files)
-        try:
-            r.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            try:
-                err = e.response.json()
-            except Exception:
-                err = {
-                    "status": e.response.status_code,
-                    "text": e.response.text[:500],
-                }
-            raise HTTPException(502, f"Cloudinary upload failed: {err}")
-        return r.json()
-
-
-@app.post("/flow/filter-and-publish")
-async def flow_filter_and_publish(
-    url: str = Body(..., embed=True),
-    preset: str = Body("cinematic", embed=True),
-    intensity: float = Body(0.7, embed=True),
-    caption: Optional[str] = Body(None, embed=True),
-    share_to_feed: bool = Body(True, embed=True),
-    cover_url: Optional[str] = Body(None, embed=True),
-    timeout_sec: int = Body(600, embed=True),
-    poll_interval_sec: float = Body(1.5, embed=True),
-    cloudinary_folder: Optional[str] = Body(None, embed=True),
-):
-    """
-    Сценарий: фильтруем видео → заливаем в Cloudinary (unsigned) → публикуем в IG.
-    Требуются ENV: IG_ACCESS_TOKEN (+ страница с IG бизнес-аккаунтом) и CLOUDINARY_*.
-    """
-    # 1) enqueue
-    payload = {"url": url, "preset": preset, "intensity": float(intensity)}
-    try:
-        job_obj_or_id = create_job(kind="video_filter", payload=payload)
-    except TypeError:
-        # совместимость со старой сигнатурой
-        job_obj_or_id = create_job(payload=payload)
-
-    job_id = getattr(job_obj_or_id, "id", job_obj_or_id)
-    if not isinstance(job_id, str):
-        job_id = str(job_id)
-    await job_queue.put(job_id)
-
-    # 2) wait for DONE (or ERROR/timeout)
-    deadline = time.time() + max(10, timeout_sec)
-    last_status = None
-    while time.time() < deadline:
-        j = get_job(job_id)
-        if not j:
-            await asyncio.sleep(poll_interval_sec)
-            continue
-        st = (j.get("status") or "").upper()
-        last_status = {"status": st, "result": j.get("result"), "error": j.get("error")}
-        if st == "DONE":
-            break
-        if st == "ERROR":
-            return {
-                "ok": False,
-                "stage": "filter",
-                "job_id": job_id,
-                "error": j.get("error") or "unknown error",
-                "last_status": last_status,
-            }
-        await asyncio.sleep(poll_interval_sec)
-
-    if not last_status or last_status.get("status") != "DONE":
-        return {
-            "ok": False,
-            "stage": "filter",
-            "job_id": job_id,
-            "error": "timeout waiting filter result",
-        }
-
-    result = (get_job(job_id) or {}).get("result") or {}
-    out_url_local = result.get("output_url")
-    if not out_url_local:
-        return {
-            "ok": False,
-            "stage": "filter",
-            "job_id": job_id,
-            "error": "no output_url from filter",
-        }
-
-    # 3) upload to Cloudinary (unsigned)
-    try:
-        # превращаем output_url в абсолютный локальный путь
-        # пример output_url: "/static/out/flt_vid_out_xxx.mp4"
-        if out_url_local.startswith("/static/"):
-            rel = out_url_local[len("/static/") :]  # "out/xxx.mp4"
-            local_path = STATIC_DIR / rel
-        else:
-            # на всякий случай: возьмём basename и посмотрим в OUT_DIR
-            local_path = OUT_DIR / Path(out_url_local).name
-
-        if not local_path.exists():
-            return {
-                "ok": False,
-                "stage": "cloudinary",
-                "error": f"local file not found: {local_path} (from output_url={out_url_local})",
-            }
-
-        cld_resp = await _cloudinary_unsigned_upload_file(
-            local_path,
-            resource_type="video",
-            folder=cloudinary_folder,
-        )
-        secure_url = cld_resp.get("secure_url")
-        if not secure_url:
-            return {
-                "ok": False,
-                "stage": "cloudinary",
-                "error": "no secure_url in Cloudinary response",
-            }
-
-    except HTTPException as he:
-        # пробрасываем как есть — FastAPI сам превратит в ответ
-        raise he
-    except Exception as e:
-        return {"ok": False, "stage": "cloudinary", "error": str(e)}
-
-    # 4) publish to IG (используем наш уже существующий обработчик)
-    try:
-        publish_resp = await ig_publish_video(
-            video_url=secure_url,
-            caption=caption,
-            cover_url=cover_url,
-            share_to_feed=share_to_feed,
-        )
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        return {"ok": False, "stage": "publish", "error": str(e)}
-
-    return {
-        "ok": True,
-        "job_id": job_id,
-        "filtered_local": out_url_local,
-        "cloudinary": {
-            "secure_url": secure_url,
-            "public_id": cld_resp.get("public_id"),
-        },
-        "publish": publish_resp,
-    }
-
-
-# === FLOW: filter → cover → Cloudinary → publish =======================
-
-
-async def _cloudinary_unsigned_upload_bytes(
-    data: bytes,
-    *,
-    filename: str,
-    resource_type: str = "image",
-    folder: Optional[str] = None,
-    public_id: Optional[str] = None,
-) -> Dict[str, Any]:
-    if not CLOUDINARY_CLOUD or not CLOUDINARY_UNSIGNED_PRESET:
-        raise HTTPException(
-            400,
-            "Cloudinary not configured: set CLOUDINARY_CLOUD and CLOUDINARY_UNSIGNED_PRESET",
-        )
-
-    endpoint = (
-        f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD}/{resource_type}/upload"
-    )
-    form = {"upload_preset": CLOUDINARY_UNSIGNED_PRESET}
-    if folder:
-        form["folder"] = folder
-    if public_id:
-        form["public_id"] = public_id
-
-    files = {
-        "file": (
-            filename,
-            data,
-            "image/jpeg" if resource_type == "image" else "application/octet-stream",
-        )
-    }
-
-    async with httpx.AsyncClient(timeout=300) as client:
-        r = await client.post(endpoint, data=form, files=files)
-        try:
-            r.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            try:
-                err = e.response.json()
-            except Exception:
-                err = {"status": e.response.status_code, "text": e.response.text[:500]}
-            raise HTTPException(502, f"Cloudinary upload failed: {err}")
-        return r.json()
-
-
-@app.post("/flow/filter-publish-with-cover")
-async def flow_filter_publish_with_cover(
-    url: str = Body(..., embed=True),
-    preset: str = Body("cinematic", embed=True),
-    intensity: float = Body(0.7, embed=True),
-    caption: Optional[str] = Body(None, embed=True),
-    share_to_feed: bool = Body(True, embed=True),
-    # cover options
-    at: float = Body(1.0, embed=True, description="секунда кадра для обложки"),
-    title: Optional[str] = Body(None, embed=True),
-    title_pos: str = Body("bottom", embed=True),  # bottom | top
-    title_font: Optional[str] = Body(
-        None, embed=True
-    ),  # напр. "Inter" (если установлен)
-    title_padding: int = Body(32, embed=True),
-    cloudinary_folder: Optional[str] = Body(None, embed=True),
-    timeout_sec: int = Body(600, embed=True),
-    poll_interval_sec: float = Body(1.5, embed=True),
-):
-    """
-    Фильтруем видео → извлекаем кадр и рисуем титул → грузим в Cloudinary → публикуем в IG с cover.
-    Требуются ENV: IG_ACCESS_TOKEN (+страница с IG бизнес-аккаунтом) и CLOUDINARY_*.
-    """
-    # 1) фильтруем видео (enqueue + ожидание)
-    payload = {"url": url, "preset": preset, "intensity": float(intensity)}
-    try:
-        job_obj_or_id = create_job(kind="video_filter", payload=payload)
-    except TypeError:
-        job_obj_or_id = create_job(payload=payload)
-
-    job_id = getattr(job_obj_or_id, "id", job_obj_or_id)
-    if not isinstance(job_id, str):
-        job_id = str(job_id)
-    await job_queue.put(job_id)
-
-    deadline = time.time() + max(10, timeout_sec)
-    result = None
-    while time.time() < deadline:
-        j = get_job(job_id)
-        if j:
-            st = (j.get("status") or "").upper()
-            if st == "DONE":
-                result = j.get("result") or {}
-                break
-            if st == "ERROR":
-                return {
-                    "ok": False,
-                    "stage": "filter",
-                    "job_id": job_id,
-                    "error": j.get("error"),
-                }
-        await asyncio.sleep(poll_interval_sec)
-
-    if not result or not result.get("output_url"):
-        return {
-            "ok": False,
-            "stage": "filter",
-            "job_id": job_id,
-            "error": "timeout or no output_url",
-        }
-
-    # локальный путь до отфильтрованного видео
-    if str(result["output_url"]).startswith("/static/"):
-        rel = str(result["output_url"])[len("/static/") :]  # "out/xxx.mp4"
-        local_video_path = STATIC_DIR / rel
-    else:
-        local_video_path = OUT_DIR / Path(str(result["output_url"])).name
-
-    if not local_video_path.exists():
-        return {
-            "ok": False,
-            "stage": "local_video",
-            "error": f"not found: {local_video_path}",
-        }
-
-    # 2) вытаскиваем кадр для обложки (ffmpeg)
-    if not has_ffmpeg():
-        return {"ok": False, "stage": "ffmpeg", "error": "ffmpeg not available"}
-
-    frame = OUT_DIR / uuid_name("cover_frame", ".jpg")
-    p = subprocess.run(
-        [
-            FFMPEG,
-            "-y",
-            "-ss",
-            str(max(0.0, at)),
-            "-i",
-            str(local_video_path),
-            "-frames:v",
-            "1",
-            "-q:v",
-            "2",
-            str(frame),
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if p.returncode != 0:
-        return {"ok": False, "stage": "cover_frame", "stderr": p.stderr[-800:]}
-
-    # 3) рисуем заголовок (если задан) — PIL
-    cover_path = frame
-    if title and PIL_OK:
-        try:
-            img = Image.open(frame).convert("RGBA")
-            draw = ImageDraw.Draw(img)
-            font = pick_font(size=64, name=title_font)
-
-            wrapped = textwrap.fill(title, width=20)
-            # оценка размеров текста
-            if hasattr(draw, "multiline_textbbox"):
-                bbox = draw.multiline_textbbox(
-                    (0, 0), wrapped, font=font, spacing=4, align="left"
-                )
-                tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-            else:
-                try:
-                    bbox = draw.textbbox((0, 0), wrapped, font=font)
-                    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-                except Exception:
-                    tw, th = draw.textsize(wrapped, font=font)
-
-            pad = max(8, int(title_padding))
-            if title_pos == "top":
-                xy = (pad, pad)
-            else:
-                xy = (pad, img.height - th - pad)
-
-            # полупрозрачный бэкграунд под текст
-            bg = Image.new("RGBA", (tw + pad * 2, th + pad * 2), (0, 0, 0, 160))
-            img.paste(bg, (xy[0] - pad, xy[1] - pad), bg)
-            draw.multiline_text(
-                xy, wrapped, font=font, fill=(255, 255, 255, 255), spacing=4
-            )
-
-            cover_rgba = OUT_DIR / uuid_name("cover", ".png")
-            img.save(cover_rgba)
-
-            # JPEG для Cloudinary (экономичнее)
-            cover_jpg = OUT_DIR / uuid_name("cover", ".jpg")
-            _save_image_rgb(Image.open(cover_rgba), cover_jpg, quality=92)
-            cover_path = cover_jpg
-        except Exception:
-            # fail-safe — шлём исходный кадр
-            cover_path = frame
-
-    # 4) Cloudinary: грузим видео + обложку
-    try:
-        cld_video = await _cloudinary_unsigned_upload_file(
-            local_video_path, resource_type="video", folder=cloudinary_folder
-        )
-        cld_cover = await _cloudinary_unsigned_upload_file(
-            cover_path, resource_type="image", folder=cloudinary_folder
-        )
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        return {"ok": False, "stage": "cloudinary", "error": str(e)}
-
-    video_secure_url = cld_video.get("secure_url")
-    cover_secure_url = cld_cover.get("secure_url")
-    if not video_secure_url or not cover_secure_url:
-        return {
-            "ok": False,
-            "stage": "cloudinary",
-            "error": "upload failed",
-            "video_ok": bool(video_secure_url),
-            "cover_ok": bool(cover_secure_url),
-        }
-
-    # 5) Публикуем в IG с cover_url
-    try:
-        publish_resp = await ig_publish_video(
-            video_url=video_secure_url,
-            caption=caption,
-            cover_url=cover_secure_url,
-            share_to_feed=share_to_feed,
-        )
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        return {"ok": False, "stage": "publish", "error": str(e)}
-
-    return {
-        "ok": True,
-        "job_id": job_id,
-        "filtered_local": str(local_video_path),
-        "cover_local": str(cover_path),
-        "cloudinary": {
-            "video_public_id": cld_video.get("public_id"),
-            "video_url": video_secure_url,
-            "cover_public_id": cld_cover.get("public_id"),
-            "cover_url": cover_secure_url,
-        },
-        "publish": publish_resp,
-    }
 
 
 # 8) SCHEDULER (in-memory; dev)
@@ -1580,7 +911,7 @@ async def ig_schedule(
     creation_id: str = Body(..., embed=True),
     publish_at: str = Body(..., embed=True),  # ISO, e.g. 2025-09-08T12:00:00Z
 ):
-    st = await _load_state()
+    st = await load_state()
     run_at = iso_to_utc(publish_at)
     job_id = uuid.uuid4().hex
     JOBS[job_id] = {
@@ -1643,7 +974,7 @@ async def ig_publish_batch(
     items: List[Dict[str, Any]] = Body(..., embed=True),
     throttle_ms: int = Body(500, embed=True),
 ):
-    st = await _load_state()
+    st = await load_state()
     results = []
     async with httpx.AsyncClient(timeout=120) as client:
         for it in items:
@@ -1762,42 +1093,6 @@ async def ig_publish_batch(
     return {"ok": True, "results": results}
 
 
-# ── Housekeeping: cleanup old temp files ────────────────────────────────
-@app.delete("/util/cleanup")
-def cleanup_tmp(hours: int = 12):
-    """
-    Удаляет файлы из uploads/ и out/, которым больше N часов.
-    Default: 12h
-    """
-    cutoff = time.time() - hours * 3600
-    removed = []
-    for d in [UPLOAD_DIR, OUT_DIR]:
-        for p in d.glob("*"):
-            try:
-                if p.is_file() and p.stat().st_mtime < cutoff:
-                    p.unlink()
-                    removed.append(p.name)
-            except Exception:
-                # Игнорируем частные ошибки удаления (busy, race, perms)
-                pass
-    return {"ok": True, "removed": removed, "count": len(removed)}
-
-
-@app.get("/util/fonts")
-def list_fonts(q: Optional[str] = None, limit: int = 100):
-    idx = font_index()
-    items = sorted(idx.items())
-    if q:
-        ql = q.lower()
-        items = [(k, v) for k, v in items if ql in k]
-    items = items[: max(1, min(limit, 500))]
-    return {
-        "ok": True,
-        "count": len(items),
-        "fonts": [{"name": k, "path": v} for k, v in items],
-    }
-
-
 # корневой пинг
 @app.get("/")
 def root():
@@ -1806,11 +1101,11 @@ def root():
         "service": "meta-ig-tools",
         "endpoints": [
             "/health",
-            "/oauth/start",
-            "/oauth/callback",
+            "/auth/oauth/start",
+            "/auth/oauth/callback",
             "/me/instagram",
             "/me/pages",
-            "/debug/scopes",
+            "/auth/debug/scopes",
             "/ig/media",
             "/ig/comments",
             "/ig/comment",

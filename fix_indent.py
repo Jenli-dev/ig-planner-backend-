@@ -1,50 +1,43 @@
 import sys, re
 
-path = sys.argv[1]
-start = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+def main():
+    path = sys.argv[1]
+    start = int(sys.argv[2]) if len(sys.argv) > 2 else 1
 
-with open(path, 'r', encoding='utf-8') as f:
-    lines = f.readlines()
+    with open(path, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
 
-import sys, re
+    lines = [ln.replace('\t', '    ') for ln in lines]
 
-path = sys.argv[1]
-start = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+    block_re = re.compile(
+        r'^\s*(?:async\s+def|def|class|if|elif|else:|for|while|try:|except\b|finally:|with|async\s+with)\b'
+    )
 
-with open(path, 'r', encoding='utf-8') as f:
-    lines = f.readlines()
+    def is_block_opener(line: str) -> bool:
+        code = line.split('#', 1)[0].rstrip()
+        return code.endswith(':') and bool(block_re.match(code))
 
-# 1) tabs -> 4 spaces
-lines = [ln.replace('\t', '    ') for ln in lines]
+    i = start - 1
+    n = len(lines)
 
-# 2) блок-опенеры (строки, которые открывают блок и оканчиваются ':')
-block_re = re.compile(
-    r'^\s*(?:async\s+def|def|class|if|elif|else:|for|while|try:|except\b|finally:|with|async\s+with)\b'
-)
+    while i < n:
+        if is_block_opener(lines[i]):
+            base_indent = len(lines[i]) - len(lines[i].lstrip(' '))
+            j = i + 1
+            while j < n and (lines[j].strip() == '' or lines[j].lstrip().startswith('#')):
+                j += 1
+            if j < n:
+                cur_indent = len(lines[j]) - len(lines[j].lstrip(' '))
+                if cur_indent <= base_indent:
+                    lines[j] = ' ' * (base_indent + 4) + lines[j].lstrip()
+            i = j
+        else:
+            i += 1
 
-def is_block_opener(line: str) -> bool:
-    code = line.split('#', 1)[0].rstrip()
-    return code.endswith(':') and bool(block_re.match(code))
+    with open(path, 'w', encoding='utf-8') as f:
+        f.writelines(lines)
 
-i = start - 1
-n = len(lines)
+    print(f"Fixed indentation from line {start} → EOF.")
 
-while i < n:
-    if is_block_opener(lines[i]):
-        base_indent = len(lines[i]) - len(lines[i].lstrip(' '))
-        j = i + 1
-        # пропускаем пустые/комменты
-        while j < n and (lines[j].strip() == '' or lines[j].lstrip().startswith('#')):
-            j += 1
-        if j < n:
-            cur_indent = len(lines[j]) - len(lines[j].lstrip(' '))
-            if cur_indent <= base_indent:
-                lines[j] = ' ' * (base_indent + 4) + lines[j].lstrip()
-        i = j
-    else:
-        i += 1
-
-with open(path, 'w', encoding='utf-8') as f:
-    f.writelines(lines)
-
-print(f"Fixed indentation from line {start} → EOF.")
+if __name__ == "__main__":
+    main()

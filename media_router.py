@@ -4,9 +4,9 @@ import subprocess
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
-from fastapi import APIRouter, Body, Query, HTTPException, Request
+from fastapi import APIRouter, Body, Query, HTTPException
 
-from jobs import create_job, get_job
+from jobs import create_job, get_job, rpush_job
 from ffmpeg_utils import FFMPEG, FFPROBE, has_ffmpeg, ffprobe_json
 from file_utils import uuid_name, ext_from_url, public_url, download_to
 from fonts_utils import PIL_OK
@@ -449,11 +449,7 @@ async def media_filter_image(
 
 # 7) FILTER VIDEO (enqueue)
 @router.post("/filter/video")
-async def enqueue_filter_video(request: Request, body: dict = Body(...)):
-    job_queue = getattr(request.app.state, "job_queue", None)
-    if job_queue is None:
-        raise HTTPException(500, "job_queue is not configured on app.state")
-
+async def enqueue_filter_video(body: dict = Body(...)):
     url = body.get("url")
     preset = body.get("preset")
     intensity = body.get("intensity", 0.7)
@@ -464,15 +460,22 @@ async def enqueue_filter_video(request: Request, body: dict = Body(...)):
         raise HTTPException(400, "Field 'preset' is required")
 
     payload = {"url": url, "preset": preset, "intensity": float(intensity)}
-    job_id = create_job(kind="video_filter", payload=payload)
 
-    await job_queue.put(job_id)
-    return {"ok": True, "job_id": job_id, "status_url": f"/media/filter/status?job_id={job_id}"}
+    job = await create_job(kind="video_filter", payload=payload)
+    job_id = job["job_id"]
+
+    await rpush_job(job_id)
+
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "status_url": f"/media/filter/status?job_id={job_id}",
+    }
 
 
 @router.get("/filter/status")
 async def media_filter_status(job_id: str):
-    job = get_job(job_id)
+    job = await get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
     return {
