@@ -71,12 +71,6 @@ CLOUD_REELS_TRANSFORM = (
 JWT_SECRET = os.getenv("JWT_SECRET", "super_secret_key").strip()
 
 # ─────────────────────────────────────────────────────────────
-# Background workers / jobs
-# ─────────────────────────────────────────────────────────────
-
-VIDEO_WORKERS = int(os.getenv("VIDEO_WORKERS", "1"))
-
-# ─────────────────────────────────────────────────────────────
 # Backward-compatible aliases (for legacy main.py code)
 # ─────────────────────────────────────────────────────────────
 

@@ -21,7 +21,7 @@ def _now() -> float:
     return time.time()
 
 
-_redis: redis.Redis | None = None
+_redis: Optional[redis.Redis] = None
 
 
 async def get_redis() -> redis.Redis:

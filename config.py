@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 
 from pydantic import Field
@@ -41,7 +42,7 @@ class Settings(BaseSettings):
     REDIS_QUEUE: str = "jobs:queue"
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=None if os.getenv("DISABLE_DOTENV") == "1" else ".env",
         env_file_encoding="utf-8",
         extra="ignore",
     )

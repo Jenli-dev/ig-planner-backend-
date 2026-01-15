@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Body, Query, HTTPException
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 import asyncio
 import httpx
 from uuid import uuid4
@@ -10,9 +10,67 @@ from http_client import RetryClient
 from meta_config import GRAPH_BASE, CLOUDINARY_CLOUD
 from cloudinary_utils import cld_inject_transform, CLOUD_REELS_TRANSFORM
 from services.ig_publish import publish_reel
+from time_utils import iso_to_utc, sleep_seconds_until
 
 
 router = APIRouter(prefix="/ig", tags=["ig"])
+
+
+async def _wait_container_ready(
+    client: RetryClient,
+    *,
+    creation_id: str,
+    access_token: str,
+    max_wait_sec: int = 60,
+    sleep_sec: float = 2.0,
+):
+    """
+    Poll container status before publish to avoid "Media ID is not available".
+    Works for both image and video containers; will return when FINISHED.
+    """
+    waited = 0.0
+    status_code = "IN_PROGRESS"
+    status_text = None
+    while waited < max_wait_sec:
+        rstat = await client.get(
+            f"{GRAPH_BASE}/{creation_id}",
+            params={"fields": "status,status_code", "access_token": access_token},
+            retries=4,
+            timeout=30,
+        )
+        try:
+            rstat.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            return {
+                "ok": False,
+                "stage": "check_status",
+                "status": (e.response.status_code if e.response else None),
+                "creation_id": creation_id,
+                "error": (e.response.json() if e.response else str(e)),
+            }
+        payload_stat = rstat.json() or {}
+        status_code = payload_stat.get("status_code") or "IN_PROGRESS"
+        status_text = payload_stat.get("status")
+        if status_code == "FINISHED":
+            return {"ok": True}
+        if status_code == "ERROR":
+            return {
+                "ok": False,
+                "stage": "processing",
+                "status_code": status_code,
+                "status": status_text,
+                "creation_id": creation_id,
+            }
+        await asyncio.sleep(sleep_sec)
+        waited += sleep_sec
+    return {
+        "ok": False,
+        "stage": "timeout",
+        "status_code": status_code,
+        "status": status_text,
+        "creation_id": creation_id,
+        "waited_sec": waited,
+    }
 
 
 # ── IG: latest media ────────────────────────────────────────────────────
@@ -255,6 +313,16 @@ async def ig_publish_image(
             if not creation_id:
                 return {"ok": False, "stage": "create", "error": "No creation_id in response"}
 
+            wait = await _wait_container_ready(
+                client,
+                creation_id=creation_id,
+                access_token=st["page_token"],
+                max_wait_sec=60,
+                sleep_sec=2,
+            )
+            if not wait.get("ok"):
+                return wait
+
             r2 = await client.post(
                 f"{GRAPH_BASE}/{st['ig_id']}/media_publish",
                 data={"creation_id": creation_id, "access_token": st["page_token"]},
@@ -312,6 +380,119 @@ async def ig_publish_video_from_cloudinary(
         cover_url=cover_url,
         share_to_feed=share_to_feed,
     )
+
+
+# ── IG: PUBLISH STORIES (image/video) ───────────────────────────────────
+@router.post("/publish/story/image")
+async def ig_publish_story_image(
+    image_url: str = Body(..., embed=True),
+):
+    st = await load_state()
+    async with RetryClient() as client:
+        payload = {
+            "access_token": st["page_token"],
+            "image_url": image_url,
+            "media_type": "STORIES",
+        }
+        try:
+            r1 = await client.post(
+                f"{GRAPH_BASE}/{st['ig_id']}/media",
+                data=payload,
+                retries=4,
+                timeout=60,
+            )
+            r1.raise_for_status()
+            creation_id = (r1.json() or {}).get("id")
+            if not creation_id:
+                return {"ok": False, "stage": "create", "error": "No creation_id in response"}
+
+            wait = await _wait_container_ready(
+                client,
+                creation_id=creation_id,
+                access_token=st["page_token"],
+                max_wait_sec=60,
+                sleep_sec=2,
+            )
+            if not wait.get("ok"):
+                return wait
+
+            r2 = await client.post(
+                f"{GRAPH_BASE}/{st['ig_id']}/media_publish",
+                data={"creation_id": creation_id, "access_token": st["page_token"]},
+                retries=4,
+                timeout=60,
+            )
+            r2.raise_for_status()
+            return {"ok": True, "creation_id": creation_id, "published": r2.json()}
+        except httpx.HTTPStatusError as e:
+            try:
+                err_json = e.response.json()
+            except Exception:
+                err_json = {"raw": (e.response.text[:500] if e.response else str(e))}
+            return {
+                "ok": False,
+                "stage": "graph",
+                "status": (e.response.status_code if e.response else None),
+                "error": err_json,
+            }
+        except Exception as e:
+            return {"ok": False, "stage": "client", "error": str(e)}
+
+
+@router.post("/publish/story/video")
+async def ig_publish_story_video(
+    video_url: str = Body(..., embed=True),
+):
+    st = await load_state()
+    async with RetryClient() as client:
+        payload = {
+            "access_token": st["page_token"],
+            "video_url": video_url,
+            "media_type": "STORIES",
+        }
+        try:
+            r1 = await client.post(
+                f"{GRAPH_BASE}/{st['ig_id']}/media",
+                data=payload,
+                retries=4,
+                timeout=180,
+            )
+            r1.raise_for_status()
+            creation_id = (r1.json() or {}).get("id")
+            if not creation_id:
+                return {"ok": False, "stage": "create", "error": "No creation_id in response"}
+
+            wait = await _wait_container_ready(
+                client,
+                creation_id=creation_id,
+                access_token=st["page_token"],
+                max_wait_sec=150,
+                sleep_sec=2,
+            )
+            if not wait.get("ok"):
+                return wait
+
+            r2 = await client.post(
+                f"{GRAPH_BASE}/{st['ig_id']}/media_publish",
+                data={"creation_id": creation_id, "access_token": st["page_token"]},
+                retries=4,
+                timeout=60,
+            )
+            r2.raise_for_status()
+            return {"ok": True, "creation_id": creation_id, "published": r2.json()}
+        except httpx.HTTPStatusError as e:
+            try:
+                err_json = e.response.json()
+            except Exception:
+                err_json = {"raw": (e.response.text[:500] if e.response else str(e))}
+            return {
+                "ok": False,
+                "stage": "graph",
+                "status": (e.response.status_code if e.response else None),
+                "error": err_json,
+            }
+        except Exception as e:
+            return {"ok": False, "stage": "client", "error": str(e)}
 
 # ── IG: INSIGHTS (media, smart metrics) ────────────────────────────────
 REELS_METRICS = [
@@ -517,3 +698,204 @@ async def ig_comment_after_publish(
         except httpx.HTTPStatusError as e:
             return {"ok": False, "stage": "comment", "error": e.response.json()}
         return {"ok": True, "result": r.json()}
+
+
+# 8) SCHEDULER (in-memory; dev)
+JOBS: Dict[str, Dict[str, Any]] = {}
+
+
+async def _publish_job(
+    job_id: str, ig_id: str, page_token: str, creation_id: str, run_at: datetime
+):
+    wait = sleep_seconds_until(run_at)
+    await asyncio.sleep(wait)
+    if JOBS.get(job_id, {}).get("status") == "canceled":
+        return
+    async with RetryClient() as client:
+        try:
+            r = await client.post(
+                f"{GRAPH_BASE}/{ig_id}/media_publish",
+                data={"creation_id": creation_id, "access_token": page_token},
+                retries=4,
+            )
+            r.raise_for_status()
+            JOBS[job_id]["status"] = "done"
+            JOBS[job_id]["result"] = r.json()
+        except Exception as e:
+            JOBS[job_id]["status"] = "error"
+            JOBS[job_id]["error"] = str(e)
+
+
+@router.post("/schedule")
+async def ig_schedule(
+    creation_id: str = Body(..., embed=True),
+    publish_at: str = Body(..., embed=True),  # ISO, e.g. 2025-09-08T12:00:00Z
+):
+    st = await load_state()
+    run_at = iso_to_utc(publish_at)
+    job_id = uuid4().hex
+    JOBS[job_id] = {
+        "status": "scheduled",
+        "creation_id": creation_id,
+        "publish_at": run_at.isoformat(),
+    }
+    asyncio.create_task(
+        _publish_job(job_id, st["ig_id"], st["page_token"], creation_id, run_at)
+    )
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "status": "scheduled",
+        "publish_at_utc": run_at.isoformat(),
+    }
+
+
+@router.get("/schedule")
+def ig_schedule_list():
+    return {"ok": True, "jobs": JOBS}
+
+
+@router.delete("/schedule/{job_id}")
+def ig_schedule_cancel(job_id: str):
+    if job_id not in JOBS:
+        raise HTTPException(404, "Job not found")
+    JOBS[job_id]["status"] = "canceled"
+    return {"ok": True}
+
+
+# 9) BATCH PUBLISH
+@router.post("/publish/batch")
+async def ig_publish_batch(
+    items: List[Dict[str, Any]] = Body(..., embed=True),
+    throttle_ms: int = Body(500, embed=True),
+):
+    st = await load_state()
+    results = []
+    async with RetryClient() as client:
+        for it in items:
+            t = (it.get("type") or "").lower()
+            try:
+                if t == "image":
+                    payload = {
+                        "image_url": it["image_url"],
+                        "access_token": st["page_token"],
+                    }
+                    if it.get("caption"):
+                        payload["caption"] = it["caption"]
+
+                    r1 = await client.post(
+                        f"{GRAPH_BASE}/{st['ig_id']}/media", data=payload
+                    )
+                    r1.raise_for_status()
+                    creation_id = r1.json().get("id")
+                    if not creation_id:
+                        raise RuntimeError("No creation_id in response")
+
+                    wait = await _wait_container_ready(
+                        client,
+                        creation_id=creation_id,
+                        access_token=st["page_token"],
+                        max_wait_sec=60,
+                        sleep_sec=2,
+                    )
+                    if not wait.get("ok"):
+                        results.append({"type": "image", "ok": False, "error": wait, "creation_id": creation_id})
+                        continue
+
+                    r2 = await client.post(
+                        f"{GRAPH_BASE}/{st['ig_id']}/media_publish",
+                        data={
+                            "creation_id": creation_id,
+                            "access_token": st["page_token"],
+                        },
+                    )
+                    r2.raise_for_status()
+                    results.append(
+                        {
+                            "type": "image",
+                            "ok": True,
+                            "creation_id": creation_id,
+                            "published": r2.json(),
+                        }
+                    )
+
+                elif t in ("video", "reel"):
+                    payload = {
+                        "video_url": it["video_url"],
+                        "media_type": "REELS",
+                        "access_token": st["page_token"],
+                        "share_to_feed": (
+                            "true" if it.get("share_to_feed", True) else "false"
+                        ),
+                    }
+                    if it.get("caption"):
+                        payload["caption"] = it["caption"]
+                    if it.get("cover_url"):
+                        payload["cover_url"] = it["cover_url"]
+
+                    r1 = await client.post(
+                        f"{GRAPH_BASE}/{st['ig_id']}/media", data=payload
+                    )
+                    r1.raise_for_status()
+                    creation_id = r1.json().get("id")
+
+                    done = False
+                    waited = 0
+                    while waited < 120:
+                        rs = await client.get(
+                            f"{GRAPH_BASE}/{creation_id}",
+                            params={
+                                "fields": "status_code",
+                                "access_token": st["page_token"],
+                            },
+                        )
+                        rs.raise_for_status()
+                        sc = (rs.json() or {}).get("status_code")
+                        if sc == "FINISHED":
+                            done = True
+                            break
+                        if sc == "ERROR":
+                            raise RuntimeError("Processing error")
+                        await asyncio.sleep(2)
+                        waited += 2
+
+                    if not done:
+                        raise RuntimeError("Processing timeout")
+
+                    r2 = await client.post(
+                        f"{GRAPH_BASE}/{st['ig_id']}/media_publish",
+                        data={
+                            "creation_id": creation_id,
+                            "access_token": st["page_token"],
+                        },
+                    )
+                    r2.raise_for_status()
+                    results.append(
+                        {
+                            "type": "reel",
+                            "ok": True,
+                            "creation_id": creation_id,
+                            "published": r2.json(),
+                        }
+                    )
+
+                else:
+                    results.append(
+                        {"ok": False, "error": f"Unsupported type: {t}", "item": it}
+                    )
+
+            except httpx.HTTPStatusError as e:
+                results.append(
+                    {
+                        "ok": False,
+                        "status": e.response.status_code,
+                        "error": e.response.json(),
+                        "item": it,
+                    }
+                )
+            except Exception as e:
+                results.append({"ok": False, "error": str(e), "item": it})
+
+            await asyncio.sleep(max(0.0, throttle_ms / 1000.0))
+
+    return {"ok": True, "results": results}
