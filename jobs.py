@@ -58,6 +58,7 @@ async def create_job(kind: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         "job_id": job_id,
         "kind": kind,
         "status": PENDING,
+        "stage": "queued",
         "payload": payload,
         "result": None,
         "error": None,
@@ -82,6 +83,7 @@ async def update_job_status(
     *,
     result: Optional[Dict[str, Any]] = None,
     error: Optional[str] = None,
+    stage: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     r = await get_redis()
     key = _job_key(job_id)
@@ -93,6 +95,8 @@ async def update_job_status(
     data = json.loads(raw)
     data["status"] = status
     data["updated_at"] = _now()
+    if stage is not None:
+        data["stage"] = stage
     if result is not None:
         data["result"] = result
     if error is not None:

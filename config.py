@@ -32,6 +32,15 @@ class Settings(BaseSettings):
     FFPROBE_BIN: str = "ffprobe"
     MEDIA_TMP_DIR: str = "/tmp/ig_planner"
 
+    # AI / Generation
+    AI_PROVIDER: str = "fal"
+    FAL_KEY: Optional[str] = None
+    REPLICATE_API_TOKEN: Optional[str] = None
+    FAL_T2I_ENDPOINT: str = "https://fal.run/fal-ai/flux/schnell"
+    FAL_I2I_ENDPOINT: str = "https://fal.run/fal-ai/flux/image-to-image"
+    REPLICATE_T2I_MODEL: Optional[str] = None
+    REPLICATE_I2I_MODEL: Optional[str] = None
+
     # Jobs
     VIDEO_WORKERS: int = 2
     JOB_TTL_SECONDS: int = 60 * 60  # 1 час

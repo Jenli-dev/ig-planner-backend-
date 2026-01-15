@@ -15,6 +15,9 @@ from routers.flow import router as flow_router
 from routers.me import router as me_router
 from routers.ig import router as ig_router
 from routers.webhooks import router as webhooks_router
+from routers.ai import router as ai_router
+from routers.uploads import router as uploads_router
+from ai_worker import process_ai_job
 from ffmpeg_utils import FFMPEG, has_ffmpeg
 from file_utils import download_to, ext_from_url, uuid_name, public_url
 from jobs import brpop_job, get_job, update_job_status, RUNNING, DONE, ERROR, close_redis
@@ -36,6 +39,8 @@ app.include_router(flow_router)
 app.include_router(me_router)
 app.include_router(ig_router)
 app.include_router(webhooks_router)
+app.include_router(ai_router)
+app.include_router(uploads_router)
 
 # ── JOB WORKERS (Redis-backed queue is handled inside jobs.py) ──────────
 VIDEO_WORKERS = settings.VIDEO_WORKERS
@@ -131,8 +136,11 @@ async def _worker_loop(worker_idx: int):
         try:
             await update_job_status(job_id, RUNNING)
 
-            if (job.get("kind") or "").lower() == "video_filter":
+            kind = (job.get("kind") or "").lower()
+            if kind == "video_filter":
                 await _process_video_task(job_id)
+            elif kind in ("image_t2i", "image_i2i", "avatar_batch"):
+                await process_ai_job(job_id, job)
             else:
                 await update_job_status(
                     job_id, ERROR, error=f"Unknown job kind: {job.get('kind')}"
@@ -191,6 +199,11 @@ def root():
         "service": "meta-ig-tools",
         "endpoints": [
             "/health",
+            "/uploads/image",
+            "/ai/generate/text",
+            "/ai/generate/image",
+            "/ai/generate/batch",
+            "/ai/status",
             "/auth/oauth/start",
             "/auth/oauth/callback",
             "/me/instagram",

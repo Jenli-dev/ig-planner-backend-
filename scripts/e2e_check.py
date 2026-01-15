@@ -29,6 +29,28 @@ def request_json(
         return 0, {"error": str(exc)}
 
 
+def request_multipart(
+    client: httpx.Client,
+    path: str,
+    *,
+    file_name: str,
+    file_bytes: bytes,
+    content_type: str,
+    timeout: float = 180.0,
+) -> Tuple[int, Any]:
+    url = f"{client.base_url}{path}"
+    try:
+        files = {"file": (file_name, file_bytes, content_type)}
+        resp = client.post(url, files=files, timeout=timeout)
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = resp.text
+        return resp.status_code, payload
+    except Exception as exc:
+        return 0, {"error": str(exc)}
+
+
 def record(results: List[Dict[str, Any]], name: str, status: int, payload: Any) -> None:
     ok = bool(status and 200 <= status < 300)
     results.append({"name": name, "ok": ok, "status": status, "payload": payload})
@@ -41,6 +63,34 @@ def pick_media(items: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], O
     return img, vid, any_item
 
 
+def poll_job(
+    client: httpx.Client,
+    status_path: str,
+    *,
+    timeout_sec: int = 300,
+    sleep_sec: int = 2,
+) -> Tuple[int, Any]:
+    end_at = time.time() + timeout_sec
+    last_status, last_payload = 0, {}
+    while time.time() < end_at:
+        last_status, last_payload = request_json(client, "GET", status_path)
+        if isinstance(last_payload, dict) and last_payload.get("status") in ("DONE", "ERROR"):
+            break
+        time.sleep(sleep_sec)
+    return last_status, last_payload
+
+
+def fetch_bytes(url: str) -> Tuple[Optional[bytes], Optional[str]]:
+    try:
+        with httpx.Client(timeout=30) as client:
+            r = client.get(url)
+            r.raise_for_status()
+            ctype = r.headers.get("Content-Type", "image/jpeg")
+            return r.content, ctype
+    except Exception:
+        return None, None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="E2E checks for IG Planner backend")
     parser.add_argument("--base-url", default=os.getenv("BASE_URL", "http://127.0.0.1:8000"))
@@ -48,6 +98,7 @@ def main() -> int:
     parser.add_argument("--allow-publish", action="store_true", help="Allow publish endpoints.")
     parser.add_argument("--allow-filter", action="store_true", help="Allow /media/filter/video checks.")
     parser.add_argument("--allow-cloudinary", action="store_true", help="Allow Cloudinary upload checks.")
+    parser.add_argument("--allow-ai", action="store_true", help="Allow AI generation checks.")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -157,12 +208,8 @@ def main() -> int:
 
             if isinstance(payload, dict) and payload.get("job_id"):
                 job_id = payload["job_id"]
-                for _ in range(15):
-                    time.sleep(2)
-                    s2, p2 = request_json(client, "GET", f"/media/filter/status?job_id={job_id}")
-                    record(results, "GET /media/filter/status", s2, p2)
-                    if isinstance(p2, dict) and p2.get("status") in ("DONE", "ERROR"):
-                        break
+                s2, p2 = poll_job(client, f"/media/filter/status?job_id={job_id}", timeout_sec=180)
+                record(results, "GET /media/filter/status", s2, p2)
 
         cloud_img_url = None
         cloud_vid_url = None
@@ -229,6 +276,80 @@ def main() -> int:
         if args.allow_mutating:
             status, payload = request_json(client, "DELETE", "/util/cleanup?hours=0")
             record(results, "DELETE /util/cleanup", status, payload)
+
+        # AI endpoints
+        if args.allow_ai:
+            ai_image_url = None
+            if args.allow_cloudinary:
+                source_url = None
+                if img and img.get("media_url"):
+                    source_url = img["media_url"]
+                if not source_url:
+                    source_url = "https://www.gstatic.com/webp/gallery/1.jpg"
+                data_bytes, ctype = fetch_bytes(source_url)
+                if data_bytes:
+                    status, payload = request_multipart(
+                        client,
+                        "/uploads/image",
+                        file_name="e2e.jpg",
+                        file_bytes=data_bytes,
+                        content_type=ctype or "image/jpeg",
+                        timeout=120,
+                    )
+                    record(results, "POST /uploads/image", status, payload)
+                    if isinstance(payload, dict):
+                        ai_image_url = payload.get("image_url")
+
+            status, payload = request_json(
+                client,
+                "POST",
+                "/ai/generate/text",
+                json_body={"prompt": "studio portrait, soft light", "aspect_ratio": "1:1", "steps": 30},
+                timeout=60,
+            )
+            record(results, "POST /ai/generate/text", status, payload)
+            if isinstance(payload, dict) and payload.get("job_id"):
+                s2, p2 = poll_job(client, f"/ai/status?job_id={payload['job_id']}", timeout_sec=300)
+                record(results, "GET /ai/status (t2i)", s2, p2)
+
+            if ai_image_url:
+                status, payload = request_json(
+                    client,
+                    "POST",
+                    "/ai/generate/image",
+                    json_body={
+                        "image_url": ai_image_url,
+                        "prompt": "cinematic portrait, warm tones",
+                        "strength": 0.6,
+                        "aspect_ratio": "3:4",
+                        "steps": 30,
+                    },
+                    timeout=60,
+                )
+                record(results, "POST /ai/generate/image", status, payload)
+                if isinstance(payload, dict) and payload.get("job_id"):
+                    s2, p2 = poll_job(client, f"/ai/status?job_id={payload['job_id']}", timeout_sec=300)
+                    record(results, "GET /ai/status (i2i)", s2, p2)
+
+                batch_urls = [ai_image_url] * 15
+                status, payload = request_json(
+                    client,
+                    "POST",
+                    "/ai/generate/batch",
+                    json_body={
+                        "image_urls": batch_urls,
+                        "prompt": "avatar style, clean skin, studio light",
+                        "strength": 0.55,
+                        "aspect_ratio": "1:1",
+                        "steps": 30,
+                        "variants_per_image": 1,
+                    },
+                    timeout=60,
+                )
+                record(results, "POST /ai/generate/batch", status, payload)
+                if isinstance(payload, dict) and payload.get("job_id"):
+                    s2, p2 = poll_job(client, f"/ai/status?job_id={payload['job_id']}", timeout_sec=600)
+                    record(results, "GET /ai/status (batch)", s2, p2)
 
     # summary
     total = len(results)
