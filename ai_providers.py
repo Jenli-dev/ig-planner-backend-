@@ -75,10 +75,10 @@ async def fal_i2i(payload: Dict[str, Any], *, timeout_sec: float = 300) -> Tuple
     headers = {"Authorization": f"Key {settings.FAL_KEY}"}
     body = {
         "prompt": payload.get("prompt"),
-        "image_url": payload.get("image_url"),
+        "image_urls": [payload.get("image_url")],
         "strength": payload.get("strength"),
         "aspect_ratio": payload.get("aspect_ratio"),
-        "steps": payload.get("steps"),
+        "num_inference_steps": payload.get("steps"),
         "seed": payload.get("seed"),
     }
     data = await _http_post_json(settings.FAL_I2I_ENDPOINT, headers=headers, body=body, timeout_sec=timeout_sec)
