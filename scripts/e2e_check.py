@@ -130,7 +130,7 @@ def main() -> int:
         status, payload = request_json(
             client,
             "GET",
-            "/ig/insights/account?metrics=impressions,reach,profile_views&period=day",
+            "/ig/insights/account?metrics=reach,profile_views&period=day",
         )
         record(results, "GET /ig/insights/account", status, payload)
 
