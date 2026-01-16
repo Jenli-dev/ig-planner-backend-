@@ -650,13 +650,17 @@ async def ig_account_insights(
 
     async with RetryClient() as client:
         try:
+            params = {
+                "metric": ",".join(req_metrics),
+                "period": period,
+                "access_token": st["page_token"],
+            }
+            # profile_views requires metric_type=total_value
+            if "profile_views" in req_metrics:
+                params["metric_type"] = "total_value"
             r = await client.get(
                 f"{GRAPH_BASE}/{st['ig_id']}/insights",
-                params={
-                    "metric": ",".join(req_metrics),
-                    "period": period,
-                    "access_token": st["page_token"],
-                },
+                params=params,
                 retries=4,
             )
             r.raise_for_status()
