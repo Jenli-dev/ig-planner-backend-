@@ -36,7 +36,6 @@ class Settings(BaseSettings):
     AI_PROVIDER: str = "fal"
     FAL_KEY: Optional[str] = None
     REPLICATE_API_TOKEN: Optional[str] = None
-    FAL_T2I_ENDPOINT: str = "https://fal.run/fal-ai/flux/schnell"
     FAL_I2I_ENDPOINT: str = "https://fal.run/fal-ai/flux/image-to-image"
     REPLICATE_T2I_MODEL: Optional[str] = None
     REPLICATE_I2I_MODEL: Optional[str] = None
@@ -49,6 +48,15 @@ class Settings(BaseSettings):
     REDIS_URL: Optional[str] = None
     REDIS_PREFIX: str = "jobs"
     REDIS_QUEUE: str = "jobs:queue"
+
+    # Analytics & Attribution
+    APPHUD_API_KEY: Optional[str] = None
+    ADAPTY_API_KEY: Optional[str] = None
+    
+    # Apple Search Ads API
+    APPLE_SEARCH_ADS_KEY_ID: Optional[str] = None
+    APPLE_SEARCH_ADS_ISSUER_ID: Optional[str] = None
+    APPLE_SEARCH_ADS_PRIVATE_KEY: Optional[str] = None  # Base64 encoded .p8 key content
 
     model_config = SettingsConfigDict(
         env_file=None if os.getenv("DISABLE_DOTENV") == "1" else ".env",

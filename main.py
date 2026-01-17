@@ -17,6 +17,8 @@ from routers.ig import router as ig_router
 from routers.webhooks import router as webhooks_router
 from routers.ai import router as ai_router
 from routers.uploads import router as uploads_router
+from routers.analytics import router as analytics_router
+from routers.accounts import router as accounts_router
 from ai_worker import process_ai_job
 from ffmpeg_utils import FFMPEG, has_ffmpeg
 from file_utils import download_to, ext_from_url, uuid_name, public_url
@@ -41,6 +43,8 @@ app.include_router(ig_router)
 app.include_router(webhooks_router)
 app.include_router(ai_router)
 app.include_router(uploads_router)
+app.include_router(analytics_router)
+app.include_router(accounts_router)
 
 # ── JOB WORKERS (Redis-backed queue is handled inside jobs.py) ──────────
 VIDEO_WORKERS = settings.VIDEO_WORKERS

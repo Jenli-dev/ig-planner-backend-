@@ -1,5 +1,6 @@
 # routers/me.py
-from fastapi import APIRouter
+from typing import Optional
+from fastapi import APIRouter, Query
 import httpx
 
 from services.ig_state import load_state
@@ -9,8 +10,10 @@ from meta_config import IG_LONG_TOKEN, ME_URL, GRAPH_BASE
 router = APIRouter(prefix="/me", tags=["me"])
 
 @router.get("/instagram")
-async def me_instagram():
-    st = await load_state()
+async def me_instagram(
+    account_id: Optional[str] = Query(None, description="Account ID (page_id) to use"),
+):
+    st = await load_state(account_id=account_id)
     return {
         "ok": True,
         "page_id": st["page_id"],

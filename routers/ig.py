@@ -75,8 +75,12 @@ async def _wait_container_ready(
 
 # ── IG: latest media ────────────────────────────────────────────────────
 @router.get("/media")
-async def ig_media(limit: int = 12, after: Optional[str] = None):
-    st = await load_state()
+async def ig_media(
+    limit: int = 12,
+    after: Optional[str] = None,
+    account_id: Optional[str] = Query(None, description="Account ID (page_id) to use"),
+):
+    st = await load_state(account_id=account_id)
     ig_id, page_token = st["ig_id"], st["page_token"]
 
     params = {
@@ -494,6 +498,50 @@ async def ig_publish_story_video(
         except Exception as e:
             return {"ok": False, "stage": "client", "error": str(e)}
 
+
+# ── IG: PROFILE ──────────────────────────────────────────────────────────
+@router.get("/profile")
+async def ig_profile(
+    account_id: Optional[str] = Query(None, description="Account ID (page_id) to use"),
+):
+    """Получает базовую информацию о профиле Instagram"""
+    st = await load_state(account_id=account_id)
+    ig_id, page_token = st["ig_id"], st["page_token"]
+
+    async with RetryClient() as client:
+        r = await client.get(
+            f"{GRAPH_BASE}/{ig_id}",
+            params={
+                "access_token": page_token,
+                "fields": ",".join([
+                    "id",
+                    "username",
+                    "name",
+                    "biography",
+                    "profile_picture_url",
+                    "media_count",
+                    "followers_count",
+                    "follows_count",
+                ]),
+            },
+            retries=4,
+        )
+        r.raise_for_status()
+        data = r.json()
+
+    return {
+        "ok": True,
+        "id": data.get("id"),
+        "username": data.get("username"),
+        "name": data.get("name"),
+        "biography": data.get("biography"),
+        "profile_picture_url": data.get("profile_picture_url"),
+        "media_count": data.get("media_count"),
+        "followers_count": data.get("followers_count"),
+        "follows_count": data.get("follows_count"),
+    }
+
+
 # ── IG: INSIGHTS (media, smart metrics) ────────────────────────────────
 REELS_METRICS = [
     "views",
@@ -628,8 +676,9 @@ async def ig_media_insights(
 async def ig_account_insights(
     metrics: str = Query("impressions,reach,profile_views"),
     period: str = Query("day"),
+    account_id: Optional[str] = Query(None, description="Account ID (page_id) to use"),
 ):
-    st = await load_state()
+    st = await load_state(account_id=account_id)
     req_metrics = [m.strip() for m in metrics.split(",") if m.strip()]
 
     bad = [m for m in req_metrics if m not in ACCOUNT_INSIGHT_ALLOWED]
