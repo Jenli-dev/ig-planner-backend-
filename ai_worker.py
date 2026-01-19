@@ -15,6 +15,7 @@ from cloudinary_utils import cloudinary_unsigned_upload_file
 from config import settings
 from file_utils import download_to, uuid_name
 from jobs import update_job_status, DONE, ERROR, RUNNING
+from services.ai_subscription import use_credits
 
 
 async def _download_and_upload(urls: List[str]) -> List[str]:
@@ -120,6 +121,20 @@ async def process_ai_job(job_id: str, job: Dict[str, Any]) -> None:
                 raise RuntimeError("No images uploaded to Cloudinary")
             result = {"provider": provider, "images": uploaded, "meta": meta}
             await update_job_status(job_id, DONE, result=result, stage="done")
+            
+            # Списываем кредиты после успешной генерации
+            user_id = payload.get("user_id")
+            operation_type = payload.get("operation_type")
+            if user_id and operation_type and not payload.get("credits_deducted"):
+                try:
+                    credits_result = await use_credits(user_id, operation_type)
+                    if credits_result["success"]:
+                        print(f"[ai] job_id={job_id} credits deducted: {credits_result['credits_used']}, remaining: {credits_result['credits_remaining']}")
+                    else:
+                        print(f"[ai] job_id={job_id} WARNING: Failed to deduct credits: {credits_result.get('error')}")
+                except Exception as exc:
+                    print(f"[ai] job_id={job_id} ERROR: Exception while deducting credits: {exc}")
+            
             print(f"[ai] job_id={job_id} kind={kind} provider={provider} stage=done")
             return
 
@@ -132,6 +147,20 @@ async def process_ai_job(job_id: str, job: Dict[str, Any]) -> None:
                 raise RuntimeError("No images uploaded to Cloudinary")
             result = {"provider": provider, "images": uploaded, "meta": meta}
             await update_job_status(job_id, DONE, result=result, stage="done")
+            
+            # Списываем кредиты после успешной генерации
+            user_id = payload.get("user_id")
+            operation_type = payload.get("operation_type")
+            if user_id and operation_type and not payload.get("credits_deducted"):
+                try:
+                    credits_result = await use_credits(user_id, operation_type)
+                    if credits_result["success"]:
+                        print(f"[ai] job_id={job_id} credits deducted: {credits_result['credits_used']}, remaining: {credits_result['credits_remaining']}")
+                    else:
+                        print(f"[ai] job_id={job_id} WARNING: Failed to deduct credits: {credits_result.get('error')}")
+                except Exception as exc:
+                    print(f"[ai] job_id={job_id} ERROR: Exception while deducting credits: {exc}")
+            
             print(f"[ai] job_id={job_id} kind={kind} provider={provider} stage=done")
             return
 
@@ -179,6 +208,20 @@ async def process_ai_job(job_id: str, job: Dict[str, Any]) -> None:
                 },
             }
             await update_job_status(job_id, DONE, result=result, stage="done")
+            
+            # Списываем кредиты после успешной генерации avatar batch
+            user_id = payload.get("user_id")
+            operation_type = payload.get("operation_type")
+            if user_id and operation_type and not payload.get("credits_deducted"):
+                try:
+                    credits_result = await use_credits(user_id, operation_type)
+                    if credits_result["success"]:
+                        print(f"[ai] job_id={job_id} credits deducted: {credits_result['credits_used']}, remaining: {credits_result['credits_remaining']}")
+                    else:
+                        print(f"[ai] job_id={job_id} WARNING: Failed to deduct credits: {credits_result.get('error')}")
+                except Exception as exc:
+                    print(f"[ai] job_id={job_id} ERROR: Exception while deducting credits: {exc}")
+            
             print(f"[ai] job_id={job_id} kind={kind} stage=done")
             return
 
