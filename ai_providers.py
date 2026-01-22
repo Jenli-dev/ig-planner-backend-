@@ -62,13 +62,11 @@ async def fal_t2i(payload: Dict[str, Any], *, timeout_sec: float = 300) -> Tuple
         "steps": payload.get("steps"),
         "seed": payload.get("seed"),
     }
-    # Use FAL_I2I_ENDPOINT pattern or default T2I endpoint
-    endpoint = getattr(settings, "FAL_T2I_ENDPOINT", "https://fal.run/fal-ai/flux/text-to-image")
-    data = await _http_post_json(endpoint, headers=headers, body=body, timeout_sec=timeout_sec)
+    data = await _http_post_json(settings.FAL_T2I_ENDPOINT, headers=headers, body=body, timeout_sec=timeout_sec)
     urls = _extract_image_urls(data)
     if not urls:
         raise AIProviderError(f"No images in FAL response: {data}", retryable=False)
-    return urls, {"model": endpoint, "aspect_ratio": payload.get("aspect_ratio"), "seed": payload.get("seed")}
+    return urls, {"model": settings.FAL_T2I_ENDPOINT, "aspect_ratio": payload.get("aspect_ratio"), "seed": payload.get("seed")}
 
 
 async def fal_i2i(payload: Dict[str, Any], *, timeout_sec: float = 300) -> Tuple[List[str], Dict[str, Any]]:

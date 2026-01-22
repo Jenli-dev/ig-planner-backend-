@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     AI_PROVIDER: str = "fal"
     FAL_KEY: Optional[str] = None
     REPLICATE_API_TOKEN: Optional[str] = None
+    FAL_T2I_ENDPOINT: str = "https://fal.run/fal-ai/flux/text-to-image"
     FAL_I2I_ENDPOINT: str = "https://fal.run/fal-ai/flux/image-to-image"
     REPLICATE_T2I_MODEL: Optional[str] = None
     REPLICATE_I2I_MODEL: Optional[str] = None
