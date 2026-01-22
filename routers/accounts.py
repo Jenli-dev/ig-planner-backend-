@@ -2,12 +2,14 @@
 """
 Роутер для управления множественными Instagram аккаунтами.
 """
+import json
 from typing import List, Optional
 from fastapi import APIRouter, HTTPException, Query, Body
 import httpx
 
 from http_client import RetryClient
 from meta_config import ME_URL, GRAPH_BASE, APP_ID, APP_SECRET
+from jobs import get_redis
 from services.account_manager import (
     add_account,
     get_account,
@@ -17,6 +19,7 @@ from services.account_manager import (
     remove_account,
     _default_user_id,
     initialize_from_env,
+    _account_key,
 )
 
 router = APIRouter(prefix="/accounts", tags=["accounts"])
@@ -212,10 +215,7 @@ async def accounts_refresh(
         account["ig_username"] = ig_username
         
         # Сохраняем обновленные данные
-        from jobs import get_redis
-        import json
         r_redis = await get_redis()
-        from services.account_manager import _account_key
         account_key = _account_key(user_id, account_id)
         await r_redis.set(account_key, json.dumps(account))
         

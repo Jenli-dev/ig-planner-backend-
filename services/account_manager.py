@@ -4,6 +4,7 @@
 Хранит информацию об аккаунтах в Redis.
 """
 import json
+import time
 from typing import Dict, Any, List, Optional
 import redis.asyncio as redis
 
@@ -61,7 +62,7 @@ async def add_account(
         "ig_id": ig_id,
         "ig_username": ig_username,
         "is_active": True,
-        "created_at": json.dumps({"timestamp": __import__("time").time()}),
+        "created_at": json.dumps({"timestamp": time.time()}),
     }
     
     # Сохраняем данные аккаунта
