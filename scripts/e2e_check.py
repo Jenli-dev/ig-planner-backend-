@@ -270,6 +270,27 @@ def main() -> int:
             )
             record(results, "POST /ig/publish/video_from_cloudinary", status, payload)
 
+        # Stories publishing
+        if args.allow_publish and cloud_img_url:
+            status, payload = request_json(
+                client,
+                "POST",
+                "/ig/publish/story/image",
+                json_body={"image_url": cloud_img_url},
+                timeout=180,
+            )
+            record(results, "POST /ig/publish/story/image", status, payload)
+
+        if args.allow_publish and cloud_vid_url:
+            status, payload = request_json(
+                client,
+                "POST",
+                "/ig/publish/story/video",
+                json_body={"video_url": cloud_vid_url},
+                timeout=300,
+            )
+            record(results, "POST /ig/publish/story/video", status, payload)
+
         status, payload = request_json(client, "GET", "/util/fonts?limit=5")
         record(results, "GET /util/fonts", status, payload)
 
